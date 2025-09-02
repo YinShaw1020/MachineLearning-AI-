@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 import io
 import time
 import os
-import pickle
 
 # =========================
 # From-scratch utilities
@@ -89,7 +88,6 @@ def classification_report_np(y_true, y_pred):
     )
 
 def roc_curve_np(y_true, scores):
-    # y_true in {0,1}; scores: higher -> more likely positive
     y_true = np.asarray(y_true)
     scores = np.asarray(scores)
     order = np.argsort(-scores)
@@ -100,7 +98,6 @@ def roc_curve_np(y_true, scores):
     fps = np.cumsum(y == 0)
     tpr = tps / (P + 1e-12)
     fpr = fps / (N + 1e-12)
-    # add (0,0) and (1,1)
     fpr = np.concatenate([[0.0], fpr, [1.0]])
     tpr = np.concatenate([[0.0], tpr, [1.0]])
     return fpr, tpr
@@ -118,14 +115,12 @@ def pca_fit_transform(X, n_components=2):
 
 # ---------- VIF (no statsmodels) ----------
 def vif_table(X, feature_names):
-    # Regress each feature on others via closed-form OLS to get R^2 -> VIF = 1/(1-R^2)
     X = np.asarray(X)
     n, p = X.shape
     out = []
     for j in range(p):
         y = X[:, j]
         X_others = np.delete(X, j, axis=1)
-        # add intercept
         Xo = np.hstack([np.ones((n,1)), X_others])
         beta = np.linalg.pinv(Xo) @ y
         yhat = Xo @ beta
@@ -145,17 +140,13 @@ def simple_smote(X, y, k=5, random_state=42):
     n_pos, n_neg = len(X_pos), len(X_neg)
     if n_pos == n_neg:
         return X.copy(), y.copy()
-    # target: balance to the larger class
     if n_pos < n_neg:
         minority = X_pos; minority_label = 1
-        majority_n = n_neg; need = n_neg - n_pos
+        need = n_neg - n_pos
     else:
         minority = X_neg; minority_label = 0
-        majority_n = n_pos; need = n_pos - n_neg
-    # precompute kNN in minority
-    # distances within minority
+        need = n_pos - n_neg
     if len(minority) <= 1:
-        # cannot synthesize; fallback to simple oversampling
         idx = rng.integers(0, len(minority), size=need)
         synth = minority[idx]
     else:
@@ -255,88 +246,114 @@ class LogisticRegressionScratch:
         p = self.predict_proba(X)[:,1]
         return (p >= 0.5).astype(int)
 
-# ---------- Linear SVM via Pegasos ----------
-class LinearSVMScratch:
-    def __init__(self, C=1.0, epochs=20, random_state=42):
+# ---------- Kernel SVM (RBF) via simplified SMO ----------
+class KernelSVMScratch:
+    def __init__(self, C=0.1, gamma="auto", tol=1e-3, max_passes=10, max_iter=1000, random_state=42):
         self.C = C
-        self.epochs = epochs
-        self.w = None
-        self.b = 0.0
+        self.gamma = gamma
+        self.tol = tol
+        self.max_passes = max_passes
+        self.max_iter = max_iter
         self.rng = np.random.default_rng(random_state)
+        self.alphas = None
+        self.b = 0.0
+        self.X = None
+        self.y = None
+        self.K = None  # Gram matrix
+
+    def _rbf(self, X1, X2, gamma_val):
+        X1_sq = np.sum(X1**2, axis=1)[:, None]
+        X2_sq = np.sum(X2**2, axis=1)[None, :]
+        dist2 = X1_sq + X2_sq - 2 * (X1 @ X2.T)
+        return np.exp(-gamma_val * np.clip(dist2, 0, None))
+
+    def _compute_gamma(self, X):
+        if isinstance(self.gamma, str) and self.gamma == "auto":
+            return 1.0 / X.shape[1]
+        return float(self.gamma)
+
     def fit(self, X, y):
-        # y in {0,1} -> map to {-1, +1}
-        X = np.asarray(X); y = np.asarray(y)
-        y2 = np.where(y==1, 1.0, -1.0)
-        n, d = X.shape
-        self.w = np.zeros(d); self.b = 0.0
-        t = 0
-        for _ in range(self.epochs):
-            idx = self.rng.permutation(n)
-            for i in idx:
-                t += 1
-                eta = 1.0/(self.C * t)
-                if y2[i]*(X[i] @ self.w + self.b) < 1:
-                    self.w = (1 - eta*self.C)*self.w + eta*y2[i]*X[i]
-                    self.b = self.b + eta*y2[i]
-                else:
-                    self.w = (1 - eta*self.C)*self.w
+        X = np.asarray(X, float)
+        y = np.asarray(y, int)
+        y2 = np.where(y == 1, 1.0, -1.0)
+
+        n = X.shape[0]
+        self.alphas = np.zeros(n)
+        self.b = 0.0
+        self.X = X
+        self.y = y2
+
+        gamma_val = self._compute_gamma(X)
+        self.K = self._rbf(X, X, gamma_val)
+
+        passes = 0
+        iters = 0
+        while passes < self.max_passes and iters < self.max_iter:
+            num_changed = 0
+            for i in range(n):
+                Ei = self._f_i(i) - self.y[i]
+                if (self.y[i]*Ei < -self.tol and self.alphas[i] < self.C) or (self.y[i]*Ei > self.tol and self.alphas[i] > 0):
+                    j = i
+                    while j == i:
+                        j = self.rng.integers(0, n)
+                    Ej = self._f_i(j) - self.y[j]
+
+                    alpha_i_old = self.alphas[i]
+                    alpha_j_old = self.alphas[j]
+
+                    if self.y[i] != self.y[j]:
+                        L = max(0.0, alpha_j_old - alpha_i_old)
+                        H = min(self.C, self.C + alpha_j_old - alpha_i_old)
+                    else:
+                        L = max(0.0, alpha_i_old + alpha_j_old - self.C)
+                        H = min(self.C, alpha_i_old + alpha_j_old)
+                    if L == H:
+                        continue
+
+                    eta = 2.0 * self.K[i, j] - self.K[i, i] - self.K[j, j]
+                    if eta >= 0:
+                        continue
+
+                    self.alphas[j] -= self.y[j] * (Ei - Ej) / eta
+                    if self.alphas[j] > H: self.alphas[j] = H
+                    elif self.alphas[j] < L: self.alphas[j] = L
+
+                    if abs(self.alphas[j] - alpha_j_old) < 1e-6:
+                        continue
+
+                    self.alphas[i] += self.y[i] * self.y[j] * (alpha_j_old - self.alphas[j])
+
+                    b1 = (self.b - Ei
+                          - self.y[i]*(self.alphas[i]-alpha_i_old)*self.K[i,i]
+                          - self.y[j]*(self.alphas[j]-alpha_j_old)*self.K[i,j])
+                    b2 = (self.b - Ej
+                          - self.y[i]*(self.alphas[i]-alpha_i_old)*self.K[i,j]
+                          - self.y[j]*(self.alphas[j]-alpha_j_old)*self.K[j,j])
+
+                    if 0 < self.alphas[i] < self.C:
+                        self.b = b1
+                    elif 0 < self.alphas[j] < self.C:
+                        self.b = b2
+                    else:
+                        self.b = 0.5 * (b1 + b2)
+
+                    num_changed += 1
+
+            passes = passes + 1 if num_changed == 0 else 0
+            iters += 1
         return self
+
+    def _f_i(self, i):
+        return np.sum(self.alphas * self.y * self.K[:, i]) + self.b
+
     def decision_function(self, X):
-        X = np.asarray(X)
-        return X @ self.w + self.b
+        X = np.asarray(X, float)
+        gamma_val = self._compute_gamma(self.X)
+        Kx = self._rbf(X, self.X, gamma_val)
+        return Kx @ (self.alphas * self.y) + self.b
+
     def predict(self, X):
         return (self.decision_function(X) >= 0).astype(int)
-
-# ---------- Voting ----------
-class VotingClassifierScratch:
-    def __init__(self, estimators, voting="hard", weights=None):
-        self.estimators = estimators  # list of (name, model)
-        self.voting = voting
-        self.weights = np.array(weights) if weights is not None else None
-    def fit(self, X, y):
-        for _, m in self.estimators:
-            m.fit(X, y)
-        return self
-    def predict(self, X):
-        if self.voting == "hard":
-            preds = np.column_stack([m.predict(X) for _, m in self.estimators])
-            if self.weights is None:
-                votes = preds.mean(axis=1)
-            else:
-                votes = (preds * self.weights).sum(axis=1) / self.weights.sum()
-            return (votes >= 0.5).astype(int)
-        else:
-            probas = []
-            for _, m in self.estimators:
-                if hasattr(m, "predict_proba"):
-                    probas.append(m.predict_proba(X)[:,1])
-                elif hasattr(m, "decision_function"):
-                    # scale decision to [0,1] via sigmoid-ish
-                    d = m.decision_function(X)
-                    p = 1/(1+np.exp(-d))
-                    probas.append(p)
-                else:
-                    probas.append(m.predict(X).astype(float))
-            probas = np.column_stack(probas)
-            if self.weights is None:
-                avg = probas.mean(axis=1)
-            else:
-                avg = (probas * self.weights).sum(axis=1) / self.weights.sum()
-            return (avg >= 0.5).astype(int)
-    def predict_proba(self, X):
-        # For soft voting display
-        probas = []
-        for _, m in self.estimators:
-            if hasattr(m, "predict_proba"):
-                probas.append(m.predict_proba(X)[:,1])
-            elif hasattr(m, "decision_function"):
-                d = m.decision_function(X)
-                probas.append(1/(1+np.exp(-d)))
-            else:
-                probas.append(m.predict(X).astype(float))
-        probas = np.column_stack(probas)
-        avg = probas.mean(axis=1)
-        return np.vstack([1-avg, avg]).T
 
 # =========================
 # Data pipeline (cached)
@@ -344,7 +361,6 @@ class VotingClassifierScratch:
 @st.cache_data
 def get_clean_scaled_data():
     df = pd.read_csv("heart.csv").drop_duplicates().dropna()
-    # remove outliers on selected continuous cols
     cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
     mask = np.zeros(len(df), dtype=bool)
     for c in cont_cols:
@@ -481,8 +497,6 @@ with tab1:
 with tab2:
     st.header("🧠 KNN Pipeline")
 
-    # Use the balanced/scaled data from the cleaning block above
-    # Recreate to keep the tab independent
     df_knn = (pd.read_csv(uploaded_file) if uploaded_file else pd.read_csv("heart.csv")).drop_duplicates().dropna()
     cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
     mask = np.zeros(len(df_knn), dtype=bool)
@@ -543,7 +557,6 @@ with tab2:
     with st.expander("📄 Classification Report"):
         st.code(classification_report_np(y_test, y_pred), language="text")
 
-    # Confusion Matrix (custom plot)
     cm = confusion_matrix_np(y_test, y_pred)
     fig, ax = plt.subplots()
     im = ax.imshow(cm, cmap="Blues")
@@ -637,7 +650,9 @@ with tab4:
     st.header("🧠 Support Vector Machine (SVM) Classification")
     X_train_smote, X_test, y_train_smote, y_test, feature_names, mean_glob, std_glob = get_clean_scaled_data()
 
-    svm_model = LinearSVMScratch(C=1.0, epochs=20, random_state=42).fit(X_train_smote, y_train_smote)
+    # RBF-kernel SVM with C=0.1
+    svm_model = KernelSVMScratch(C=0.1, gamma="auto", tol=1e-3, max_passes=10, max_iter=1000, random_state=42)
+    svm_model.fit(X_train_smote, y_train_smote)
     y_pred = svm_model.predict(X_test)
 
     st.subheader("📊 Evaluation Metrics")
@@ -650,12 +665,11 @@ with tab4:
     st.text("📄 Classification Report")
     st.code(classification_report_np(y_test, y_pred), language='text')
 
-    # Confusion Matrix
     st.subheader("📉 Confusion Matrix")
     cm = confusion_matrix_np(y_test, y_pred)
     fig, ax = plt.subplots()
     im = ax.imshow(cm, cmap="Blues")
-    ax.set_title("Confusion Matrix - SVM")
+    ax.set_title("Confusion Matrix - SVM (RBF, C=0.1)")
     ax.set_xticks([0,1]); ax.set_yticks([0,1])
     ax.set_xticklabels(["No Disease", "Disease"])
     ax.set_yticklabels(["No Disease", "Disease"])
@@ -667,8 +681,7 @@ with tab4:
     st.subheader("🎯 SVM Decision Boundary (PCA Projection)")
     X_pca, comps, _ = pca_fit_transform(X_train_smote, n_components=2)
     y_train_vis = y_train_smote
-
-    svm_vis = LinearSVMScratch(C=1.0, epochs=30, random_state=1).fit(X_pca, y_train_vis)
+    svm_vis = KernelSVMScratch(C=0.1, gamma="auto", max_passes=10, max_iter=1000, random_state=1).fit(X_pca, y_train_vis)
 
     x_min, x_max = X_pca[:, 0].min() - 1, X_pca[:, 0].max() + 1
     y_min, y_max = X_pca[:, 1].min() - 1, X_pca[:, 1].max() + 1
@@ -689,19 +702,16 @@ with tab4:
     st.pyplot(fig)
 
 with tab5:
-    st.header("📊 Model Comparison (with Combined/Voting Models)")
+    st.header("📊 Model Comparison")
 
-    # Load and clean dataset
     df_cmp = (pd.read_csv(uploaded_file) if uploaded_file else pd.read_csv("heart.csv")).drop_duplicates().dropna()
 
-    # Remove outliers (except 'chol' like your original comment)
     cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
     mask = np.zeros(len(df_cmp), dtype=bool)
     for c in cont_cols:
         mask |= iqr_mask(df_cmp[c].values)
     df_cmp = df_cmp.loc[~mask].copy()
 
-    # Split
     X = df_cmp.drop("target", axis=1).values.astype(float)
     y = df_cmp["target"].values.astype(int)
     mean_c, std_c = standardize_fit(X)
@@ -709,31 +719,17 @@ with tab5:
     X_train, X_test, y_train, y_test = stratified_train_test_split(
         X_scaled, y, test_size=0.2, random_state=42
     )
-
-    # SMOTE
     X_train_smote, y_train_smote = simple_smote(X_train, y_train, k=5, random_state=42)
 
-    # === Base models ===
+    # === Base models only (no voting) ===
     knn13 = KNNClassifier(n_neighbors=13)
     logreg = LogisticRegressionScratch(lr=0.1, epochs=2000, l2=0.001, random_state=42)
-    svm_lin = LinearSVMScratch(C=1.0, epochs=20, random_state=42)
-
-    # === Combined models ===
-    voting_hard = VotingClassifierScratch(
-        estimators=[("knn", knn13), ("lr", logreg), ("svm", svm_lin)],
-        voting="hard"
-    )
-    voting_soft = VotingClassifierScratch(
-        estimators=[("knn", knn13), ("lr", logreg), ("svm", svm_lin)],
-        voting="soft"
-    )
+    svm_rbf = KernelSVMScratch(C=0.1, gamma="auto", tol=1e-3, max_passes=10, max_iter=1000, random_state=42)
 
     models = {
         "KNN (k=13)": knn13,
         "Logistic Regression": logreg,
-        "SVM (Linear)": svm_lin,
-        "Combined (Hard Vote)": voting_hard,
-        "Combined (Soft Vote)": voting_soft
+        "SVM (RBF, C=0.1)": svm_rbf
     }
 
     # Train & evaluate
@@ -753,7 +749,6 @@ with tab5:
 
     df_results = pd.DataFrame(results)
 
-    # Display table
     st.dataframe(df_results.style.format({
         "Accuracy": "{:.3f}",
         "Precision": "{:.3f}",
@@ -761,7 +756,6 @@ with tab5:
         "F1 Score": "{:.3f}"
     }))
 
-    # Plot metrics (bar)
     st.subheader("🔍 Metric Comparison")
     df_melted = df_results.melt(id_vars="Model", var_name="Metric", value_name="Score")
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -772,11 +766,9 @@ with tab5:
     plt.tight_layout()
     st.pyplot(fig)
 
-    # ROC curves (compute scores)
     st.subheader("📈 ROC Curves")
     plt.figure(figsize=(8, 6))
     for name, model in trained.items():
-        # score: probability if available, else decision function, else predicted label
         if hasattr(model, "predict_proba"):
             y_score = model.predict_proba(X_test)[:, 1]
         elif hasattr(model, "decision_function"):
@@ -794,7 +786,6 @@ with tab5:
     plt.grid(True)
     st.pyplot(plt)
 
-    # Confusion Matrices
     st.subheader("🧮 Confusion Matrices")
     n_models_for_cm = len(models)
     cols = 3
@@ -803,7 +794,6 @@ with tab5:
     axes = np.array(axes).reshape(rows, cols)
 
     idx = 0
-    last_cm = None
     for name, model in trained.items():
         r, c = divmod(idx, cols)
         ax = axes[r, c]
@@ -817,50 +807,48 @@ with tab5:
         for (i,j), v in np.ndenumerate(cm):
             ax.text(j, i, str(v), ha='center', va='center', fontsize=10)
         idx += 1
-
-    # Hide any empty subplots
     while idx < rows * cols:
         r, c = divmod(idx, cols)
         axes[r, c].axis("off")
         idx += 1
-
     plt.tight_layout()
     st.pyplot(fig)
 
-    # Show last CM cells if needed
-    last_name = list(trained.keys())[-1]
-    cm_last = confusion_matrix_np(y_test, trained[last_name].predict(X_test))
-    tn, fp, fn, tp = cm_last.ravel()
-    st.write(f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
-
-    # Best model by F1
     st.subheader("🥇 Best Performing Model")
     best_model_row = df_results.loc[df_results["F1 Score"].idxmax()]
     st.success(f"**{best_model_row['Model']}** performed best with F1 Score: **{best_model_row['F1 Score']:.3f}**")
 
-    # "Model size" & inference time (pickle bytes)
-    model_sizes = {}
+    # Efficiency (no pickling): parameter count + inference time
+    def parameter_count(model):
+        if isinstance(model, KNNClassifier):
+            # stores full train set
+            return int(getattr(model, "X", np.empty((0,0))).size + getattr(model, "y", np.empty((0,))).size)
+        if isinstance(model, LogisticRegressionScratch):
+            return int((0 if model.w is None else model.w.size) + 1)  # + bias
+        if isinstance(model, KernelSVMScratch):
+            # alphas + bias (support vectors are in X)
+            return int((0 if model.alphas is None else model.alphas.size) + 1)
+        return 0
+
     inference_times = {}
+    params = {}
     for name, model in trained.items():
-        blob = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
-        model_sizes[name] = len(blob) / 1024  # KB
         start = time.time()
         _ = model.predict(X_test)
-        inference_times[name] = (time.time() - start) * 1000  # ms
+        inference_times[name] = (time.time() - start) * 1000.0
+        params[name] = parameter_count(model)
 
     df_meta = pd.DataFrame({
         "Model": list(trained.keys()),
-        "Model Size (KB)": [model_sizes[m] for m in trained.keys()],
+        "Parameter Count": [params[m] for m in trained.keys()],
         "Inference Time (ms)": [inference_times[m] for m in trained.keys()]
     })
 
     st.subheader("⚙️ Model Efficiency")
     st.dataframe(df_meta.style.format({
-        "Model Size (KB)": "{:.2f}",
         "Inference Time (ms)": "{:.2f}"
     }))
 
-    # Download
     st.subheader("⬇️Download")
     @st.cache_data
     def convert_df(df):
