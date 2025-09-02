@@ -689,38 +689,10 @@ with tab5:
         "Inference Time (ms)": "{:.2f}"
     }))
 
-    st.subheader("📌 Feature Importance (Logistic Regression)")
-    log_model = fitted["Logistic Regression"]
-    importance = pd.Series(log_model.coef_[0], index=X.columns).sort_values()
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    importance.plot(kind="barh", ax=ax)
-    plt.title("Feature Coefficients (Logistic Regression)")
-    st.pyplot(fig)
-
-    # Keep your CV line; 'model' here is last-used, but we want LR for consistency
-    cv_scores = cross_val_score(log_model, X_scaled, y, cv=5)
-    st.write(f"Cross-Validation Accuracy: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
-
-    st.subheader("🔍 Prediction Distribution by Model")
-    for name, model in fitted.items():
-        y_pred = model.predict(X_test)
-        fig, ax = plt.subplots()
-        sns.countplot(x=y_pred, palette='pastel', ax=ax)
-        ax.set_title(f"Predictions - {name}")
-        st.pyplot(fig)
-
-    import plotly.express as px
-    st.subheader("🧭 Radar Chart (Model Metrics Overview)")
-    df_melted = df_results.melt(id_vars="Model", var_name="Metric", value_name="Score")
-    fig_radar = px.line_polar(df_melted, r='Score', theta='Metric', color='Model', line_close=True,
-                              template='plotly_dark', height=500)
-    fig_radar.update_traces(fill='toself')
-    st.plotly_chart(fig_radar)
-
     st.subheader("⬇️Download")
     @st.cache_data
     def convert_df(df):
         return df.to_csv(index=False).encode('utf-8')
     csv = convert_df(df_results)
     st.download_button("📥 Download Model Metrics", data=csv, file_name='model_comparison.csv', mime='text/csv')
+
