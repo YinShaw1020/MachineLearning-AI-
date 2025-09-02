@@ -34,14 +34,20 @@ def stratified_train_test_split(X, y, test_size=0.2, random_state=42):
     y = np.asarray(y)
     idx_pos = np.where(y == 1)[0]
     idx_neg = np.where(y == 0)[0]
-    rng.shuffle(idx_pos)
-    rng.shuffle(idx_neg)
+    if len(idx_pos) == 0 or len(idx_neg) == 0:
+        # fallback: plain split
+        idx = np.arange(len(y))
+        rng.shuffle(idx)
+        n_test = int(len(y) * test_size)
+        test_idx = idx[:n_test]
+        train_idx = idx[n_test:]
+        return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
+    rng.shuffle(idx_pos); rng.shuffle(idx_neg)
     n_pos_test = int(len(idx_pos) * test_size)
     n_neg_test = int(len(idx_neg) * test_size)
     test_idx = np.concatenate([idx_pos[:n_pos_test], idx_neg[:n_neg_test]])
     train_idx = np.concatenate([idx_pos[n_pos_test:], idx_neg[n_neg_test:]])
-    rng.shuffle(test_idx)
-    rng.shuffle(train_idx)
+    rng.shuffle(test_idx); rng.shuffle(train_idx)
     return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
 
 def confusion_matrix_np(y_true, y_pred):
@@ -54,8 +60,7 @@ def confusion_matrix_np(y_true, y_pred):
     return np.array([[tn, fp], [fn, tp]])
 
 def accuracy_score_np(y_true, y_pred):
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
+    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
     return np.mean(y_true == y_pred)
 
 def precision_score_np(y_true, y_pred):
@@ -88,12 +93,12 @@ def classification_report_np(y_true, y_pred):
     )
 
 def roc_curve_np(y_true, scores):
-    y_true = np.asarray(y_true)
-    scores = np.asarray(scores)
+    y_true = np.asarray(y_true); scores = np.asarray(scores)
     order = np.argsort(-scores)
     y = y_true[order]
-    P = np.sum(y == 1)
-    N = np.sum(y == 0)
+    P = np.sum(y == 1); N = np.sum(y == 0)
+    if P == 0 or N == 0:
+        return np.array([0.0,1.0]), np.array([0.0,1.0])  # degenerate
     tps = np.cumsum(y == 1)
     fps = np.cumsum(y == 0)
     tpr = tps / (P + 1e-12)
@@ -113,10 +118,9 @@ def pca_fit_transform(X, n_components=2):
     X_pca = Xc @ components.T
     return X_pca, components, Xc.mean(axis=0)
 
-# ---------- VIF (no statsmodels) ----------
+# ---------- VIF ----------
 def vif_table(X, feature_names):
-    X = np.asarray(X)
-    n, p = X.shape
+    X = np.asarray(X); n, p = X.shape
     out = []
     for j in range(p):
         y = X[:, j]
@@ -131,21 +135,20 @@ def vif_table(X, feature_names):
         out.append(vif)
     return pd.DataFrame({"feature": feature_names, "VIF": out})
 
-# ---------- Simple SMOTE (k=5) ----------
+# ---------- Simple SMOTE ----------
 def simple_smote(X, y, k=5, random_state=42):
     rng = np.random.default_rng(random_state)
     X = np.asarray(X); y = np.asarray(y)
-    X_pos = X[y==1]
-    X_neg = X[y==0]
+    X_pos = X[y==1]; X_neg = X[y==0]
     n_pos, n_neg = len(X_pos), len(X_neg)
+    if min(n_pos, n_neg) == 0:
+        return X.copy(), y.copy()
     if n_pos == n_neg:
         return X.copy(), y.copy()
     if n_pos < n_neg:
-        minority = X_pos; minority_label = 1
-        need = n_neg - n_pos
+        minority = X_pos; minority_label = 1; need = n_neg - n_pos
     else:
-        minority = X_neg; minority_label = 0
-        need = n_pos - n_neg
+        minority = X_neg; minority_label = 0; need = n_pos - n_neg
     if len(minority) <= 1:
         idx = rng.integers(0, len(minority), size=need)
         synth = minority[idx]
@@ -165,8 +168,7 @@ def simple_smote(X, y, k=5, random_state=42):
             synth_vec = minority[i] + lam * (minority[j] - minority[i])
             synth.append(synth_vec)
         synth = np.vstack(synth)
-    X_new = np.vstack([X, synth])
-    y_new = np.concatenate([y, np.full(len(synth), minority_label)])
+    X_new = np.vstack([X, synth]); y_new = np.concatenate([y, np.full(len(synth), minority_label)])
     return X_new, y_new
 
 # ---------- Stratified K-Fold ----------
@@ -178,18 +180,15 @@ def stratified_kfold_indices(y, n_splits=10, shuffle=True, random_state=42):
     if shuffle:
         rng.shuffle(idx_pos); rng.shuffle(idx_neg)
     folds = [[] for _ in range(n_splits)]
-    for i, idx in enumerate(idx_pos):
-        folds[i % n_splits].append(idx)
-    for i, idx in enumerate(idx_neg):
-        folds[i % n_splits].append(idx)
+    for i, idx in enumerate(idx_pos): folds[i % n_splits].append(idx)
+    for i, idx in enumerate(idx_neg): folds[i % n_splits].append(idx)
     return [np.array(sorted(f)) for f in folds]
 
-# ---------- KNN (from scratch) ----------
+# ---------- KNN ----------
 class KNNClassifier:
     def __init__(self, n_neighbors=5):
         self.k = n_neighbors
-        self.X = None
-        self.y = None
+        self.X = None; self.y = None
     def fit(self, X, y):
         self.X = np.asarray(X); self.y = np.asarray(y)
         return self
@@ -214,7 +213,7 @@ class KNNClassifier:
             probs.append([1-p, p])
         return np.array(probs)
 
-# ---------- Logistic Regression (GD) ----------
+# ---------- Logistic Regression ----------
 class LogisticRegressionScratch:
     def __init__(self, lr=0.1, epochs=2000, l2=0.0, random_state=42):
         self.lr = lr; self.epochs = epochs; self.l2 = l2
@@ -227,8 +226,7 @@ class LogisticRegressionScratch:
     def fit(self, X, y):
         X = np.asarray(X); y = np.asarray(y)
         n, d = X.shape
-        self.w = self.rng.normal(scale=0.01, size=d)
-        self.b = 0.0
+        self.w = self.rng.normal(scale=0.01, size=d); self.b = 0.0
         for _ in range(self.epochs):
             z = X @ self.w + self.b
             p = self._sigmoid(z)
@@ -246,20 +244,14 @@ class LogisticRegressionScratch:
         p = self.predict_proba(X)[:,1]
         return (p >= 0.5).astype(int)
 
-# ---------- Kernel SVM (RBF) via simplified SMO ----------
+# ---------- Kernel SVM (RBF, SMO) ----------
 class KernelSVMScratch:
     def __init__(self, C=0.1, gamma="auto", tol=1e-3, max_passes=10, max_iter=1000, random_state=42):
-        self.C = C
-        self.gamma = gamma
-        self.tol = tol
-        self.max_passes = max_passes
-        self.max_iter = max_iter
+        self.C = C; self.gamma = gamma; self.tol = tol
+        self.max_passes = max_passes; self.max_iter = max_iter
         self.rng = np.random.default_rng(random_state)
-        self.alphas = None
-        self.b = 0.0
-        self.X = None
-        self.y = None
-        self.K = None  # Gram matrix
+        self.alphas = None; self.b = 0.0
+        self.X = None; self.y = None; self.K = None
 
     def _rbf(self, X1, X2, gamma_val):
         X1_sq = np.sum(X1**2, axis=1)[:, None]
@@ -275,69 +267,75 @@ class KernelSVMScratch:
     def fit(self, X, y):
         X = np.asarray(X, float)
         y = np.asarray(y, int)
-        y2 = np.where(y == 1, 1.0, -1.0)
+        if len(np.unique(y)) < 2:
+            # can't train on single-class data
+            self.X = X; self.y = np.where(y==1, 1.0, -1.0)
+            self.alphas = np.zeros(len(y)); self.b = 0.0
+            self.K = np.zeros((len(y), len(y)))
+            return self
 
+        y2 = np.where(y == 1, 1.0, -1.0)
         n = X.shape[0]
-        self.alphas = np.zeros(n)
-        self.b = 0.0
-        self.X = X
-        self.y = y2
+        self.alphas = np.zeros(n); self.b = 0.0
+        self.X = X; self.y = y2
 
         gamma_val = self._compute_gamma(X)
         self.K = self._rbf(X, X, gamma_val)
 
-        passes = 0
-        iters = 0
+        passes = 0; iters = 0
         while passes < self.max_passes and iters < self.max_iter:
             num_changed = 0
             for i in range(n):
                 Ei = self._f_i(i) - self.y[i]
-                if (self.y[i]*Ei < -self.tol and self.alphas[i] < self.C) or (self.y[i]*Ei > self.tol and self.alphas[i] > 0):
-                    j = i
-                    while j == i:
-                        j = self.rng.integers(0, n)
-                    Ej = self._f_i(j) - self.y[j]
+                cond = (self.y[i]*Ei < -self.tol and self.alphas[i] < self.C) or \
+                       (self.y[i]*Ei >  self.tol and self.alphas[i] > 0)
+                if not cond: 
+                    continue
+                j = i
+                while j == i:
+                    j = self.rng.integers(0, n)
+                Ej = self._f_i(j) - self.y[j]
 
-                    alpha_i_old = self.alphas[i]
-                    alpha_j_old = self.alphas[j]
+                alpha_i_old = self.alphas[i]
+                alpha_j_old = self.alphas[j]
 
-                    if self.y[i] != self.y[j]:
-                        L = max(0.0, alpha_j_old - alpha_i_old)
-                        H = min(self.C, self.C + alpha_j_old - alpha_i_old)
-                    else:
-                        L = max(0.0, alpha_i_old + alpha_j_old - self.C)
-                        H = min(self.C, alpha_i_old + alpha_j_old)
-                    if L == H:
-                        continue
+                if self.y[i] != self.y[j]:
+                    L = max(0.0, alpha_j_old - alpha_i_old)
+                    H = min(self.C, self.C + alpha_j_old - alpha_i_old)
+                else:
+                    L = max(0.0, alpha_i_old + alpha_j_old - self.C)
+                    H = min(self.C, alpha_i_old + alpha_j_old)
+                if L == H:
+                    continue
 
-                    eta = 2.0 * self.K[i, j] - self.K[i, i] - self.K[j, j]
-                    if eta >= 0:
-                        continue
+                eta = 2.0 * self.K[i, j] - self.K[i, i] - self.K[j, j]
+                if eta >= 0:
+                    continue
 
-                    self.alphas[j] -= self.y[j] * (Ei - Ej) / eta
-                    if self.alphas[j] > H: self.alphas[j] = H
-                    elif self.alphas[j] < L: self.alphas[j] = L
+                self.alphas[j] -= self.y[j] * (Ei - Ej) / eta
+                if self.alphas[j] > H: self.alphas[j] = H
+                elif self.alphas[j] < L: self.alphas[j] = L
 
-                    if abs(self.alphas[j] - alpha_j_old) < 1e-6:
-                        continue
+                if abs(self.alphas[j] - alpha_j_old) < 1e-6:
+                    continue
 
-                    self.alphas[i] += self.y[i] * self.y[j] * (alpha_j_old - self.alphas[j])
+                self.alphas[i] += self.y[i] * self.y[j] * (alpha_j_old - self.alphas[j])
 
-                    b1 = (self.b - Ei
-                          - self.y[i]*(self.alphas[i]-alpha_i_old)*self.K[i,i]
-                          - self.y[j]*(self.alphas[j]-alpha_j_old)*self.K[i,j])
-                    b2 = (self.b - Ej
-                          - self.y[i]*(self.alphas[i]-alpha_i_old)*self.K[i,j]
-                          - self.y[j]*(self.alphas[j]-alpha_j_old)*self.K[j,j])
+                b1 = (self.b - Ei
+                      - self.y[i]*(self.alphas[i]-alpha_i_old)*self.K[i,i]
+                      - self.y[j]*(self.alphas[j]-alpha_j_old)*self.K[i,j])
+                b2 = (self.b - Ej
+                      - self.y[i]*(self.alphas[i]-alpha_i_old)*self.K[i,j]
+                      - self.y[j]*(self.alphas[j]-alpha_j_old)*self.K[j,j])
 
-                    if 0 < self.alphas[i] < self.C:
-                        self.b = b1
-                    elif 0 < self.alphas[j] < self.C:
-                        self.b = b2
-                    else:
-                        self.b = 0.5 * (b1 + b2)
+                if 0 < self.alphas[i] < self.C:
+                    self.b = b1
+                elif 0 < self.alphas[j] < self.C:
+                    self.b = b2
+                else:
+                    self.b = 0.5 * (b1 + b2)
 
-                    num_changed += 1
+                num_changed += 1
 
             passes = passes + 1 if num_changed == 0 else 0
             iters += 1
@@ -348,6 +346,8 @@ class KernelSVMScratch:
 
     def decision_function(self, X):
         X = np.asarray(X, float)
+        if self.X is None or self.alphas is None:
+            return np.zeros(len(X))
         gamma_val = self._compute_gamma(self.X)
         Kx = self._rbf(X, self.X, gamma_val)
         return Kx @ (self.alphas * self.y) + self.b
@@ -404,6 +404,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Model Comparison"
 ])
 
+# ---------------- Tab 1 ----------------
 with tab1:
     st.header("🔍 Preprocessing: Missing Values, Outlier, Overfitting")
 
@@ -413,8 +414,7 @@ with tab1:
     st.subheader("📈 Dataset Information")
     buffer = io.StringIO()
     df.info(buf=buffer)
-    info_str = buffer.getvalue()
-    st.text(info_str)
+    st.text(buffer.getvalue())
 
     st.subheader("🧬 Data Types and Unique Values")
     feature_info = pd.DataFrame({
@@ -439,9 +439,8 @@ with tab1:
     else:
         st.warning("⚠️ No data available to display the pie chart.")
 
-    # ==================== DATA CLEANING ====================
+    # Cleaning
     st.subheader("Clean the Dataset")
-
     original_rows = df.shape[0]
     duplicate_count = df.duplicated().sum()
     df = df.drop_duplicates()
@@ -473,7 +472,6 @@ with tab1:
     vif_df = vif_table(X_vif_scaled, df.drop("target", axis=1).columns.tolist())
     st.dataframe(vif_df)
 
-    # ==================== SMOTE + SCALING ====================
     st.subheader("Apply SMOTE and Standardization")
     X_all = df.drop("target", axis=1).values.astype(float)
     y_all = df["target"].values.astype(int)
@@ -482,18 +480,19 @@ with tab1:
     X_balanced, y_balanced = simple_smote(X_scaled_all, y_all, k=5, random_state=42)
 
     st.subheader("⚖️ Class Distribution Before & After SMOTE")
-    col1, col2 = st.columns(2)
-    with col1:
+    c1, c2 = st.columns(2)
+    with c1:
         st.markdown("### Before SMOTE")
         fig1, ax1 = plt.subplots()
         sns.countplot(x=pd.Series(y_all, name="target"), ax=ax1)
         st.pyplot(fig1)
-    with col2:
+    with c2:
         st.markdown("### After SMOTE")
         fig2, ax2 = plt.subplots()
         sns.countplot(x=pd.Series(y_balanced, name="target"), ax=ax2)
         st.pyplot(fig2)
 
+# ---------------- Tab 2 (Best-K stored) ----------------
 with tab2:
     st.header("🧠 KNN Pipeline")
 
@@ -510,7 +509,6 @@ with tab2:
     X_scaled_all = standardize_transform(X_all, mean_all, std_all)
     X_balanced, y_balanced = simple_smote(X_scaled_all, y_all, k=5, random_state=42)
 
-    # ==================== BEST K SEARCH ====================
     st.subheader("Find Best K for KNN")
     k_range = range(1, 21)
     cv_scores = []
@@ -527,6 +525,9 @@ with tab2:
     best_k = list(k_range)[int(np.argmax(cv_scores))]
     best_score = np.max(cv_scores)
 
+    # store globally for reuse
+    st.session_state["best_k_knn"] = int(best_k)
+
     fig, ax = plt.subplots()
     ax.plot(list(k_range), cv_scores, marker='o')
     ax.set_xlabel("Number of Neighbors (K)")
@@ -537,16 +538,15 @@ with tab2:
 
     st.success(f"🏆 Best K = **{best_k}** with Accuracy = **{best_score:.4f}**")
 
-    # ==================== TRAIN/TEST ====================
+    # Train/test with best K
     mean_t, std_t = standardize_fit(X_all)
     X_scaled = standardize_transform(X_all, mean_t, std_t)
     X_train, X_test, y_train, y_test = stratified_train_test_split(X_scaled, y_all, test_size=0.2, random_state=42)
     X_train_smote, y_train_smote = simple_smote(X_train, y_train, k=5, random_state=42)
 
-    model = KNNClassifier(n_neighbors=best_k).fit(X_train_smote, y_train_smote)
+    model = KNNClassifier(n_neighbors=int(best_k)).fit(X_train_smote, y_train_smote)
     y_pred = model.predict(X_test)
 
-    # ==================== EVALUATION ====================
     st.subheader("Evaluation Metrics")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Accuracy", f"{accuracy_score_np(y_test, y_pred):.2f}")
@@ -569,18 +569,17 @@ with tab2:
     plt.colorbar(im, ax=ax)
     st.pyplot(fig)
 
+# ---------------- Tab 3 ----------------
 with tab3:
     st.header("📈 Logistic Regression Analysis")
 
     df_lr = (pd.read_csv(uploaded_file) if uploaded_file else pd.read_csv("heart.csv")).drop_duplicates().dropna()
 
-    # --- 1. Correlation Matrix ---
     st.subheader("🔍 Correlation Matrix")
     fig_corr, ax_corr = plt.subplots(figsize=(10, 8))
     sns.heatmap(df_lr.corr(numeric_only=True), annot=True, cmap="coolwarm", fmt=".2f", ax=ax_corr)
     st.pyplot(fig_corr)
 
-    # --- 2. Feature Scaling Visualization ---
     st.subheader("📊 Feature Scaling (Before vs After)")
     features = ['age', 'trestbps', 'chol', 'thalach', 'oldpeak']
     original_data = df_lr[features].values.astype(float)
@@ -591,12 +590,10 @@ with tab3:
     for i, col in enumerate(features):
         sns.kdeplot(original_data[:, i], label='Before Scaling', ax=axs[i])
         sns.kdeplot(scaled_df[:, i], label='After Scaling', ax=axs[i])
-        axs[i].set_title(col)
-        axs[i].legend()
+        axs[i].set_title(col); axs[i].legend()
     axs[-1].axis('off')
     st.pyplot(fig_scale)
 
-    # --- 3. Data Cleaning ---
     st.subheader("")
     original_rows = df_lr.shape[0]
     duplicate_count = df_lr.duplicated().sum()
@@ -606,12 +603,9 @@ with tab3:
 
     cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
     mask = np.zeros(len(df_lr), dtype=bool)
-    for c in cont_cols:
-        mask |= iqr_mask(df_lr[c].values)
+    for c in cont_cols: mask |= iqr_mask(df_lr[c].values)
     df_lr = df_lr.loc[~mask].copy()
-    cleaned_rows = df_lr.shape[0]
 
-    # --- 4. Model Training ---
     st.subheader("")
     X = df_lr.drop("target", axis=1).values.astype(float)
     y = df_lr["target"].values.astype(int)
@@ -624,13 +618,11 @@ with tab3:
     model = LogisticRegressionScratch(lr=0.1, epochs=2000, l2=0.001, random_state=42).fit(X_train_smote, y_train_smote)
     y_pred = model.predict(X_test)
 
-    # --- 5. Evaluation ---
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Accuracy", f"{accuracy_score_np(y_test, y_pred):.2f}")
     c2.metric("Precision", f"{precision_score_np(y_test, y_pred):.2f}")
     c3.metric("Recall", f"{recall_score_np(y_test, y_pred):.2f}")
-    c4.metric("F1 Score", f"{f1_score_np(y_test, y_pred):.2f}")
-
+    c4.metric("F1 Score", f"{f1_score_np[y_test, y_pred] if False else f1_score_np(y_test, y_pred):.2f}")  # keep layout
     with st.expander("📄 Classification Report"):
         st.code(classification_report_np(y_test, y_pred), language="text")
 
@@ -646,93 +638,103 @@ with tab3:
     plt.colorbar(im, ax=ax)
     st.pyplot(fig)
 
+# ---------------- Tab 4 (safe guards) ----------------
 with tab4:
     st.header("🧠 Support Vector Machine (SVM) Classification")
-    X_train_smote, X_test, y_train_smote, y_test, feature_names, mean_glob, std_glob = get_clean_scaled_data()
+    try:
+        X_train_smote, X_test, y_train_smote, y_test, feature_names, mean_glob, std_glob = get_clean_scaled_data()
 
-    # RBF-kernel SVM with C=0.1
-    svm_model = KernelSVMScratch(C=0.1, gamma="auto", tol=1e-3, max_passes=10, max_iter=1000, random_state=42)
-    svm_model.fit(X_train_smote, y_train_smote)
-    y_pred = svm_model.predict(X_test)
+        # stop early if a class is missing
+        if len(np.unique(y_train_smote)) < 2 or len(np.unique(y_test)) < 2:
+            st.warning("SVM cannot train/evaluate because one of the sets has only one class after cleaning. Try reducing outlier removal or using a larger dataset.")
+        else:
+            svm_model = KernelSVMScratch(C=0.1, gamma="auto", tol=1e-3, max_passes=10, max_iter=1000, random_state=42)
+            svm_model.fit(X_train_smote, y_train_smote)
+            y_pred = svm_model.predict(X_test)
 
-    st.subheader("📊 Evaluation Metrics")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Accuracy", f"{accuracy_score_np(y_test, y_pred):.2f}")
-    c2.metric("Precision", f"{precision_score_np(y_test, y_pred):.2f}")
-    c3.metric("Recall", f"{recall_score_np(y_test, y_pred):.2f}")
-    c4.metric("F1 Score", f"{f1_score_np(y_test, y_pred):.2f}")
+            st.subheader("📊 Evaluation Metrics")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Accuracy", f"{accuracy_score_np(y_test, y_pred):.2f}")
+            c2.metric("Precision", f"{precision_score_np(y_test, y_pred):.2f}")
+            c3.metric("Recall", f"{recall_score_np(y_test, y_pred):.2f}")
+            c4.metric("F1 Score", f"{f1_score_np(y_test, y_pred):.2f}")
 
-    st.text("📄 Classification Report")
-    st.code(classification_report_np(y_test, y_pred), language='text')
+            st.text("📄 Classification Report")
+            st.code(classification_report_np(y_test, y_pred), language='text')
 
-    st.subheader("📉 Confusion Matrix")
-    cm = confusion_matrix_np(y_test, y_pred)
-    fig, ax = plt.subplots()
-    im = ax.imshow(cm, cmap="Blues")
-    ax.set_title("Confusion Matrix - SVM (RBF, C=0.1)")
-    ax.set_xticks([0,1]); ax.set_yticks([0,1])
-    ax.set_xticklabels(["No Disease", "Disease"])
-    ax.set_yticklabels(["No Disease", "Disease"])
-    for (i,j), v in np.ndenumerate(cm):
-        ax.text(j, i, str(v), ha='center', va='center')
-    plt.colorbar(im, ax=ax)
-    st.pyplot(fig)
+            st.subheader("📉 Confusion Matrix")
+            cm = confusion_matrix_np(y_test, y_pred)
+            fig, ax = plt.subplots()
+            im = ax.imshow(cm, cmap="Blues")
+            ax.set_title("Confusion Matrix - SVM (RBF, C=0.1)")
+            ax.set_xticks([0,1]); ax.set_yticks([0,1])
+            ax.set_xticklabels(["No Disease", "Disease"])
+            ax.set_yticklabels(["No Disease", "Disease"])
+            for (i,j), v in np.ndenumerate(cm):
+                ax.text(j, i, str(v), ha='center', va='center')
+            plt.colorbar(im, ax=ax)
+            st.pyplot(fig)
 
-    st.subheader("🎯 SVM Decision Boundary (PCA Projection)")
-    X_pca, comps, _ = pca_fit_transform(X_train_smote, n_components=2)
-    y_train_vis = y_train_smote
-    svm_vis = KernelSVMScratch(C=0.1, gamma="auto", max_passes=10, max_iter=1000, random_state=1).fit(X_pca, y_train_vis)
+            st.subheader("🎯 SVM Decision Boundary (PCA Projection)")
+            # guard for tiny datasets
+            if X_train_smote.shape[0] >= 3:
+                X_pca, comps, _ = pca_fit_transform(X_train_smote, n_components=2)
+                y_train_vis = y_train_smote
+                svm_vis = KernelSVMScratch(C=0.1, gamma="auto", max_passes=10, max_iter=1000, random_state=1).fit(X_pca, y_train_vis)
 
-    x_min, x_max = X_pca[:, 0].min() - 1, X_pca[:, 0].max() + 1
-    y_min, y_max = X_pca[:, 1].min() - 1, X_pca[:, 1].max() + 1
-    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 500),
-                         np.linspace(y_min, y_max, 500))
-    grid = np.c_[xx.ravel(), yy.ravel()]
-    Z = svm_vis.predict(grid).reshape(xx.shape)
+                x_min, x_max = X_pca[:, 0].min() - 1, X_pca[:, 0].max() + 1
+                y_min, y_max = X_pca[:, 1].min() - 1, X_pca[:, 1].max() + 1
+                xx, yy = np.meshgrid(np.linspace(x_min, x_max, 500),
+                                     np.linspace(y_min, y_max, 500))
+                grid = np.c_[xx.ravel(), yy.ravel()]
+                Z = svm_vis.predict(grid).reshape(xx.shape)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.contourf(xx, yy, Z, cmap=plt.cm.coolwarm, alpha=0.3)
-    scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=y_train_vis, cmap=plt.cm.coolwarm, edgecolors='k')
-    legend_labels = ['No Disease', 'Heart Disease']
-    ax.legend(handles=scatter.legend_elements()[0], labels=legend_labels)
-    ax.set_title("SVM Decision Boundary (Training Data in PCA Space)")
-    ax.set_xlabel("PCA Component 1")
-    ax.set_ylabel("PCA Component 2")
-    ax.grid(True)
-    st.pyplot(fig)
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.contourf(xx, yy, Z, cmap=plt.cm.coolwarm, alpha=0.3)
+                scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=y_train_vis, cmap=plt.cm.coolwarm, edgecolors='k')
+                legend_labels = ['No Disease', 'Heart Disease']
+                ax.legend(handles=scatter.legend_elements()[0], labels=legend_labels)
+                ax.set_title("SVM Decision Boundary (Training Data in PCA Space)")
+                ax.set_xlabel("PCA Component 1")
+                ax.set_ylabel("PCA Component 2")
+                ax.grid(True)
+                st.pyplot(fig)
+            else:
+                st.info("Not enough samples to show a stable PCA decision boundary.")
+    except Exception as e:
+        st.error("SVM tab crashed; showing the exception to help locate the problem.")
+        st.exception(e)
 
+# ---------------- Tab 5 (uses Best-K from Tab 2) ----------------
 with tab5:
     st.header("📊 Model Comparison")
 
     df_cmp = (pd.read_csv(uploaded_file) if uploaded_file else pd.read_csv("heart.csv")).drop_duplicates().dropna()
-
     cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
     mask = np.zeros(len(df_cmp), dtype=bool)
-    for c in cont_cols:
-        mask |= iqr_mask(df_cmp[c].values)
+    for c in cont_cols: mask |= iqr_mask(df_cmp[c].values)
     df_cmp = df_cmp.loc[~mask].copy()
 
     X = df_cmp.drop("target", axis=1).values.astype(float)
     y = df_cmp["target"].values.astype(int)
     mean_c, std_c = standardize_fit(X)
     X_scaled = standardize_transform(X, mean_c, std_c)
-    X_train, X_test, y_train, y_test = stratified_train_test_split(
-        X_scaled, y, test_size=0.2, random_state=42
-    )
+    X_train, X_test, y_train, y_test = stratified_train_test_split(X_scaled, y, test_size=0.2, random_state=42)
     X_train_smote, y_train_smote = simple_smote(X_train, y_train, k=5, random_state=42)
 
-    # === Base models only (no voting) ===
-    knn13 = KNNClassifier(n_neighbors=13)
+    # Use best K discovered in Tab 2 (fallback = 13)
+    best_k_global = int(st.session_state.get("best_k_knn", 13))
+
+    knn = KNNClassifier(n_neighbors=best_k_global)
     logreg = LogisticRegressionScratch(lr=0.1, epochs=2000, l2=0.001, random_state=42)
     svm_rbf = KernelSVMScratch(C=0.1, gamma="auto", tol=1e-3, max_passes=10, max_iter=1000, random_state=42)
 
     models = {
-        "KNN (k=13)": knn13,
+        f"KNN (k={best_k_global})": knn,
         "Logistic Regression": logreg,
         "SVM (RBF, C=0.1)": svm_rbf
     }
 
-    # Train & evaluate
     results = []
     trained = {}
     for name, model in models.items():
@@ -748,12 +750,9 @@ with tab5:
         })
 
     df_results = pd.DataFrame(results)
-
     st.dataframe(df_results.style.format({
-        "Accuracy": "{:.3f}",
-        "Precision": "{:.3f}",
-        "Recall": "{:.3f}",
-        "F1 Score": "{:.3f}"
+        "Accuracy": "{:.3f}", "Precision": "{:.3f}",
+        "Recall": "{:.3f}", "F1 Score": "{:.3f}"
     }))
 
     st.subheader("🔍 Metric Comparison")
@@ -779,16 +778,12 @@ with tab5:
         roc_auc = auc_np(fpr, tpr)
         plt.plot(fpr, tpr, label=f"{name} (AUC = {roc_auc:.2f})")
     plt.plot([0, 1], [0, 1], 'k--')
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curve Comparison")
-    plt.legend(loc="lower right")
-    plt.grid(True)
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve Comparison"); plt.legend(loc="lower right"); plt.grid(True)
     st.pyplot(plt)
 
     st.subheader("🧮 Confusion Matrices")
-    n_models_for_cm = len(models)
-    cols = 3
+    n_models_for_cm = len(models); cols = 3
     rows = int(np.ceil(n_models_for_cm / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
     axes = np.array(axes).reshape(rows, cols)
@@ -802,8 +797,7 @@ with tab5:
         im = ax.imshow(cm, cmap="Blues")
         ax.set_title(name)
         ax.set_xticks([0,1]); ax.set_yticks([0,1])
-        ax.set_xticklabels(["No", "Yes"])
-        ax.set_yticklabels(["No", "Yes"])
+        ax.set_xticklabels(["No", "Yes"]); ax.set_yticklabels(["No", "Yes"])
         for (i,j), v in np.ndenumerate(cm):
             ax.text(j, i, str(v), ha='center', va='center', fontsize=10)
         idx += 1
@@ -811,30 +805,25 @@ with tab5:
         r, c = divmod(idx, cols)
         axes[r, c].axis("off")
         idx += 1
-    plt.tight_layout()
-    st.pyplot(fig)
+    plt.tight_layout(); st.pyplot(fig)
 
     st.subheader("🥇 Best Performing Model")
     best_model_row = df_results.loc[df_results["F1 Score"].idxmax()]
     st.success(f"**{best_model_row['Model']}** performed best with F1 Score: **{best_model_row['F1 Score']:.3f}**")
 
-    # Efficiency (no pickling): parameter count + inference time
+    # Efficiency: parameter count + inference time (no pickling)
     def parameter_count(model):
         if isinstance(model, KNNClassifier):
-            # stores full train set
             return int(getattr(model, "X", np.empty((0,0))).size + getattr(model, "y", np.empty((0,))).size)
         if isinstance(model, LogisticRegressionScratch):
-            return int((0 if model.w is None else model.w.size) + 1)  # + bias
+            return int((0 if model.w is None else model.w.size) + 1)
         if isinstance(model, KernelSVMScratch):
-            # alphas + bias (support vectors are in X)
             return int((0 if model.alphas is None else model.alphas.size) + 1)
         return 0
 
-    inference_times = {}
-    params = {}
+    inference_times = {}; params = {}
     for name, model in trained.items():
-        start = time.time()
-        _ = model.predict(X_test)
+        start = time.time(); _ = model.predict(X_test)
         inference_times[name] = (time.time() - start) * 1000.0
         params[name] = parameter_count(model)
 
@@ -843,11 +832,8 @@ with tab5:
         "Parameter Count": [params[m] for m in trained.keys()],
         "Inference Time (ms)": [inference_times[m] for m in trained.keys()]
     })
-
     st.subheader("⚙️ Model Efficiency")
-    st.dataframe(df_meta.style.format({
-        "Inference Time (ms)": "{:.2f}"
-    }))
+    st.dataframe(df_meta.style.format({"Inference Time (ms)": "{:.2f}"}))
 
     st.subheader("⬇️Download")
     @st.cache_data
