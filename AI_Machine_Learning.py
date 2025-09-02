@@ -1,736 +1,869 @@
-# app.py
-# Streamlit-only app: no external libs (numpy/pandas/sklearn/matplotlib).
-# Implements: data loading, cleaning, scaling, stratified split, simple SMOTE-like balancing,
-# KNN, Logistic Regression (GD), Linear SVM-like classifier (hinge-loss SGD),
-# metrics, confusion matrix, ROC, and basic SVG charts — all from scratch.
-
 import streamlit as st
-import csv, math, random, statistics, time, io
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import io
+import time
+import os
+import pickle
 
-# --------------------------- Utilities (no 3rd-party) ---------------------------
+# =========================
+# From-scratch utilities
+# =========================
 
-def read_csv_as_rows(file_like):
-    text = file_like.read().decode("utf-8") if hasattr(file_like, "read") else open(file_like, "r", encoding="utf-8").read()
-    f = io.StringIO(text)
-    rdr = csv.DictReader(f)
-    rows = [dict(r) for r in rdr]
-    return rows
+def standardize_fit(X):
+    mean = X.mean(axis=0)
+    std = X.std(axis=0, ddof=0)
+    std[std == 0] = 1.0
+    return mean, std
 
-def coerce_numeric(rows):
-    # Try cast to float for every field except those clearly non-numeric
-    for r in rows:
-        for k, v in list(r.items()):
-            if v is None or v == "":
-                r[k] = None
-                continue
-            try:
-                r[k] = float(v)
-            except:
-                # keep as string
-                pass
-    return rows
+def standardize_transform(X, mean, std):
+    return (X - mean) / std
 
-def dropna_rows(rows):
-    return [r for r in rows if all(v is not None for v in r.values())]
-
-def drop_duplicates(rows):
-    seen = set()
-    out = []
-    for r in rows:
-        key = tuple(sorted(r.items()))
-        if key not in seen:
-            seen.add(key)
-            out.append(r)
-    return out
-
-def column_stats(rows, cols):
-    stats = {}
-    for c in cols:
-        vals = [r[c] for r in rows if isinstance(r[c], (int, float))]
-        if len(vals) == 0:
-            stats[c] = {"count":0, "mean":None, "std":None, "min":None, "max":None}
-        else:
-            mean = sum(vals)/len(vals)
-            var = sum((x-mean)**2 for x in vals) / max(1, (len(vals)-1))
-            sd = math.sqrt(var)
-            stats[c] = {"count":len(vals), "mean":mean, "std":sd, "min":min(vals), "max":max(vals)}
-    return stats
-
-def iqr_bounds(values):
-    s = sorted(values)
-    if not s:
-        return None, None
-    def percentile(p):
-        k = p*(len(s)-1)
-        f = math.floor(k)
-        c = math.ceil(k)
-        if f == c: return s[int(k)]
-        return s[f] + (s[c]-s[f])*(k-f)
-    Q1 = percentile(0.25)
-    Q3 = percentile(0.75)
+def iqr_mask(series):
+    Q1 = np.percentile(series, 25)
+    Q3 = np.percentile(series, 75)
     IQR = Q3 - Q1
-    return Q1 - 1.5*IQR, Q3 + 1.5*IQR
+    lower = Q1 - 1.5 * IQR
+    upper = Q3 + 1.5 * IQR
+    return (series < lower) | (series > upper)
 
-def remove_outliers_iqr(rows, cont_cols):
-    keep = []
-    bounds = {}
-    for c in cont_cols:
-        vals = [r[c] for r in rows if isinstance(r[c], (int, float))]
-        lo, hi = iqr_bounds(vals)
-        bounds[c] = (lo, hi)
-    for r in rows:
-        bad = False
-        for c in cont_cols:
-            v = r.get(c, None)
-            if isinstance(v, (int, float)):
-                lo, hi = bounds[c]
-                if lo is not None and (v < lo or v > hi):
-                    bad = True; break
-        if not bad:
-            keep.append(r)
-    removed = len(rows) - len(keep)
-    return keep, removed
+def stratified_train_test_split(X, y, test_size=0.2, random_state=42):
+    rng = np.random.default_rng(random_state)
+    X = np.asarray(X)
+    y = np.asarray(y)
+    idx_pos = np.where(y == 1)[0]
+    idx_neg = np.where(y == 0)[0]
+    rng.shuffle(idx_pos)
+    rng.shuffle(idx_neg)
+    n_pos_test = int(len(idx_pos) * test_size)
+    n_neg_test = int(len(idx_neg) * test_size)
+    test_idx = np.concatenate([idx_pos[:n_pos_test], idx_neg[:n_neg_test]])
+    train_idx = np.concatenate([idx_pos[n_pos_test:], idx_neg[n_neg_test:]])
+    rng.shuffle(test_idx)
+    rng.shuffle(train_idx)
+    return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
 
-def split_Xy(rows, target="target"):
-    X_cols = [c for c in rows[0].keys() if c != target]
-    X = [[r[c] if isinstance(r[c], (int,float)) else 0.0 for c in X_cols] for r in rows]
-    y = [int(r[target]) for r in rows]
-    return X, y, X_cols
+def confusion_matrix_np(y_true, y_pred):
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    tn = np.sum((y_true == 0) & (y_pred == 0))
+    fp = np.sum((y_true == 0) & (y_pred == 1))
+    fn = np.sum((y_true == 1) & (y_pred == 0))
+    tp = np.sum((y_true == 1) & (y_pred == 1))
+    return np.array([[tn, fp], [fn, tp]])
 
-def zscore_fit(X):
-    # returns (means, stds) per feature
-    n = len(X); d = len(X[0]) if n>0 else 0
-    means = []
-    stds = []
-    for j in range(d):
-        col = [X[i][j] for i in range(n)]
-        m = sum(col)/n
-        v = sum((x-m)**2 for x in col)/max(1,n-1)
-        s = math.sqrt(v) if v>0 else 1.0
-        means.append(m); stds.append(s)
-    return means, stds
+def accuracy_score_np(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.mean(y_true == y_pred)
 
-def zscore_transform(X, means, stds):
-    Xs = []
-    for row in X:
-        Xs.append([(row[j]-means[j])/stds[j] for j in range(len(row))])
-    return Xs
+def precision_score_np(y_true, y_pred):
+    cm = confusion_matrix_np(y_true, y_pred)
+    tp = cm[1,1]; fp = cm[0,1]
+    return tp / (tp + fp + 1e-12)
 
-def stratified_train_test_split(X, y, test_size=0.2, seed=42):
-    random.seed(seed)
-    idx0 = [i for i,t in enumerate(y) if t==0]
-    idx1 = [i for i,t in enumerate(y) if t==1]
-    random.shuffle(idx0); random.shuffle(idx1)
-    n0 = len(idx0); n1 = len(idx1)
-    t0 = int(round(test_size*n0)); t1 = int(round(test_size*n1))
-    test_idx = set(idx0[:t0] + idx1[:t1])
-    X_train, y_train, X_test, y_test = [],[],[],[]
-    for i,(xi,yi) in enumerate(zip(X,y)):
-        if i in test_idx: X_test.append(xi); y_test.append(yi)
-        else: X_train.append(xi); y_train.append(yi)
-    return X_train, X_test, y_train, y_test
+def recall_score_np(y_true, y_pred):
+    cm = confusion_matrix_np(y_true, y_pred)
+    tp = cm[1,1]; fn = cm[1,0]
+    return tp / (tp + fn + 1e-12)
 
-def simple_balance_duplicate(X, y, seed=42):
-    # naive oversampling to balance classes by random duplication
-    random.seed(seed)
-    idx0 = [i for i,t in enumerate(y) if t==0]
-    idx1 = [i for i,t in enumerate(y) if t==1]
-    if len(idx0)==0 or len(idx1)==0:
-        return X[:], y[:]
-    if len(idx0)==len(idx1):
-        return X[:], y[:]
-    maj = idx0 if len(idx0)>len(idx1) else idx1
-    minr = idx1 if len(idx1)<len(idx0) else idx0
-    need = len(maj) - len(minr)
-    Xb = X[:]; yb = y[:]
-    for _ in range(need):
-        j = random.choice(minr)
-        Xb.append(X[j][:]); yb.append(y[j])
-    return Xb, yb
+def f1_score_np(y_true, y_pred):
+    p = precision_score_np(y_true, y_pred)
+    r = recall_score_np(y_true, y_pred)
+    return 2*p*r / (p + r + 1e-12)
 
-def dot(a,b): return sum(x*y for x,y in zip(a,b))
-def add(a,b): return [x+y for x,y in zip(a,b)]
-def sub(a,b): return [x-y for x,y in zip(a,b)]
-def mul_scalar(a,k): return [x*k for x in a]
-def l2_norm(a): return math.sqrt(sum(x*x for x in a))
+def classification_report_np(y_true, y_pred):
+    cm = confusion_matrix_np(y_true, y_pred)
+    p = precision_score_np(y_true, y_pred)
+    r = recall_score_np(y_true, y_pred)
+    f1 = f1_score_np(y_true, y_pred)
+    acc = accuracy_score_np(y_true, y_pred)
+    return (
+        f"Accuracy: {acc:.4f}\n"
+        f"Precision: {p:.4f}\n"
+        f"Recall: {r:.4f}\n"
+        f"F1-score: {f1:.4f}\n"
+        f"Confusion Matrix:\n{cm}"
+    )
 
-# --------------------------- Models (from scratch) ---------------------------
+def roc_curve_np(y_true, scores):
+    # y_true in {0,1}; scores: higher -> more likely positive
+    y_true = np.asarray(y_true)
+    scores = np.asarray(scores)
+    order = np.argsort(-scores)
+    y = y_true[order]
+    P = np.sum(y == 1)
+    N = np.sum(y == 0)
+    tps = np.cumsum(y == 1)
+    fps = np.cumsum(y == 0)
+    tpr = tps / (P + 1e-12)
+    fpr = fps / (N + 1e-12)
+    # add (0,0) and (1,1)
+    fpr = np.concatenate([[0.0], fpr, [1.0]])
+    tpr = np.concatenate([[0.0], tpr, [1.0]])
+    return fpr, tpr
 
-class KNN:
-    def __init__(self, k=5):
-        self.k = k
+def auc_np(fpr, tpr):
+    return np.trapz(tpr, fpr)
+
+# ---------- PCA via SVD ----------
+def pca_fit_transform(X, n_components=2):
+    Xc = X - X.mean(axis=0)
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    components = Vt[:n_components]
+    X_pca = Xc @ components.T
+    return X_pca, components, Xc.mean(axis=0)
+
+# ---------- VIF (no statsmodels) ----------
+def vif_table(X, feature_names):
+    # Regress each feature on others via closed-form OLS to get R^2 -> VIF = 1/(1-R^2)
+    X = np.asarray(X)
+    n, p = X.shape
+    out = []
+    for j in range(p):
+        y = X[:, j]
+        X_others = np.delete(X, j, axis=1)
+        # add intercept
+        Xo = np.hstack([np.ones((n,1)), X_others])
+        beta = np.linalg.pinv(Xo) @ y
+        yhat = Xo @ beta
+        ss_res = np.sum((y - yhat)**2)
+        ss_tot = np.sum((y - y.mean())**2) + 1e-12
+        r2 = 1 - ss_res/ss_tot
+        vif = 1.0 / (1 - r2 + 1e-12)
+        out.append(vif)
+    return pd.DataFrame({"feature": feature_names, "VIF": out})
+
+# ---------- Simple SMOTE (k=5) ----------
+def simple_smote(X, y, k=5, random_state=42):
+    rng = np.random.default_rng(random_state)
+    X = np.asarray(X); y = np.asarray(y)
+    X_pos = X[y==1]
+    X_neg = X[y==0]
+    n_pos, n_neg = len(X_pos), len(X_neg)
+    if n_pos == n_neg:
+        return X.copy(), y.copy()
+    # target: balance to the larger class
+    if n_pos < n_neg:
+        minority = X_pos; minority_label = 1
+        majority_n = n_neg; need = n_neg - n_pos
+    else:
+        minority = X_neg; minority_label = 0
+        majority_n = n_pos; need = n_pos - n_neg
+    # precompute kNN in minority
+    # distances within minority
+    if len(minority) <= 1:
+        # cannot synthesize; fallback to simple oversampling
+        idx = rng.integers(0, len(minority), size=need)
+        synth = minority[idx]
+    else:
+        from numpy.linalg import norm
+        neighbors = []
+        for i in range(len(minority)):
+            d = norm(minority - minority[i], axis=1)
+            nn_idx = np.argsort(d)[1:k+1] if len(minority) > k else np.argsort(d)[1:]
+            neighbors.append(nn_idx)
+        synth = []
+        for _ in range(need):
+            i = rng.integers(0, len(minority))
+            nbrs = neighbors[i]
+            j = nbrs[rng.integers(0, len(nbrs))]
+            lam = rng.random()
+            synth_vec = minority[i] + lam * (minority[j] - minority[i])
+            synth.append(synth_vec)
+        synth = np.vstack(synth)
+    X_new = np.vstack([X, synth])
+    y_new = np.concatenate([y, np.full(len(synth), minority_label)])
+    return X_new, y_new
+
+# ---------- Stratified K-Fold ----------
+def stratified_kfold_indices(y, n_splits=10, shuffle=True, random_state=42):
+    rng = np.random.default_rng(random_state)
+    y = np.asarray(y)
+    idx_pos = np.where(y==1)[0].tolist()
+    idx_neg = np.where(y==0)[0].tolist()
+    if shuffle:
+        rng.shuffle(idx_pos); rng.shuffle(idx_neg)
+    folds = [[] for _ in range(n_splits)]
+    for i, idx in enumerate(idx_pos):
+        folds[i % n_splits].append(idx)
+    for i, idx in enumerate(idx_neg):
+        folds[i % n_splits].append(idx)
+    return [np.array(sorted(f)) for f in folds]
+
+# ---------- KNN (from scratch) ----------
+class KNNClassifier:
+    def __init__(self, n_neighbors=5):
+        self.k = n_neighbors
         self.X = None
         self.y = None
     def fit(self, X, y):
-        self.X = X; self.y = y
-    def predict_one(self, x):
-        dists = []
-        for i,xi in enumerate(self.X):
-            # Euclidean distance
-            d = math.sqrt(sum((a-b)**2 for a,b in zip(x,xi)))
-            dists.append((d, self.y[i]))
-        dists.sort(key=lambda t:t[0])
-        top = dists[:self.k]
-        vote = sum(1 if cls==1 else 0 for _,cls in top)
-        # tie-break to 1 if equal? choose >= (k/2)
-        return 1 if vote*2 >= self.k else 0
+        self.X = np.asarray(X); self.y = np.asarray(y)
+        return self
     def predict(self, X):
-        return [self.predict_one(x) for x in X]
+        X = np.asarray(X)
+        from numpy.linalg import norm
+        preds = []
+        for x in X:
+            d = norm(self.X - x, axis=1)
+            nn = np.argsort(d)[:self.k]
+            vote = np.mean(self.y[nn])
+            preds.append(1 if vote >= 0.5 else 0)
+        return np.array(preds)
     def predict_proba(self, X):
-        # fraction of 1s in neighbors
+        X = np.asarray(X)
+        from numpy.linalg import norm
         probs = []
         for x in X:
-            dists = []
-            for i,xi in enumerate(self.X):
-                d = math.sqrt(sum((a-b)**2 for a,b in zip(x,xi)))
-                dists.append((d, self.y[i]))
-            dists.sort(key=lambda t:t[0])
-            top = dists[:self.k]
-            p1 = sum(1 if cls==1 else 0 for _,cls in top)/self.k
-            probs.append([1-p1, p1])
-        return probs
-
-class LogisticRegressionGD:
-    def __init__(self, lr=0.05, epochs=400, l2=0.001):
-        self.lr=lr; self.epochs=epochs; self.l2=l2
-        self.w=None; self.b=0.0
-    def _sigmoid(self, z): return 1.0/(1.0+math.exp(-z))
-    def fit(self, X, y):
-        d = len(X[0])
-        self.w = [0.0]*d; self.b = 0.0
-        for _ in range(self.epochs):
-            grad_w = [0.0]*d; grad_b=0.0
-            for xi,yi in zip(X,y):
-                z = dot(self.w, xi) + self.b
-                p = self._sigmoid(z)
-                err = p - yi
-                for j in range(d):
-                    grad_w[j] += err*xi[j]
-                grad_b += err
-            # add L2
-            for j in range(d): grad_w[j] += self.l2*self.w[j]
-            # step
-            for j in range(d): self.w[j] -= self.lr*grad_w[j]/len(X)
-            self.b -= self.lr*grad_b/len(X)
-    def predict_proba(self, X):
-        probs=[]
-        for xi in X:
-            p = self._sigmoid(dot(self.w, xi)+self.b)
+            d = norm(self.X - x, axis=1)
+            nn = np.argsort(d)[:self.k]
+            p = np.mean(self.y[nn])
             probs.append([1-p, p])
-        return probs
-    def predict(self, X):
-        return [1 if p[1]>=0.5 else 0 for p in self.predict_proba(X)]
+        return np.array(probs)
 
-class LinearSVM_SGD:
-    # Simple hinge-loss SGD with L2 regularization
-    def __init__(self, lr=0.05, epochs=400, C=1.0):
-        self.lr=lr; self.epochs=epochs; self.C=C
-        self.w=None; self.b=0.0
+# ---------- Logistic Regression (GD) ----------
+class LogisticRegressionScratch:
+    def __init__(self, lr=0.1, epochs=2000, l2=0.0, random_state=42):
+        self.lr = lr; self.epochs = epochs; self.l2 = l2
+        self.w = None; self.b = 0.0
+        self.rng = np.random.default_rng(random_state)
+    @staticmethod
+    def _sigmoid(z):
+        z = np.clip(z, -30, 30)
+        return 1.0/(1.0 + np.exp(-z))
     def fit(self, X, y):
-        d = len(X[0])
-        self.w = [0.0]*d; self.b = 0.0
-        # convert y in { -1, +1 }
-        yy = [1 if t==1 else -1 for t in y]
-        n = len(X)
+        X = np.asarray(X); y = np.asarray(y)
+        n, d = X.shape
+        self.w = self.rng.normal(scale=0.01, size=d)
+        self.b = 0.0
         for _ in range(self.epochs):
-            # SGD: shuffle
-            order = list(range(n))
-            random.shuffle(order)
-            for i in order:
-                xi = X[i]; yi = yy[i]
-                margin = yi*(dot(self.w, xi) + self.b)
-                # gradient of (1/2)||w||^2 + C*max(0,1-margin)
-                # If margin >=1: grad_w = w, grad_b = 0
-                # Else: grad_w = w - C*yi*xi, grad_b = -C*yi
-                if margin >= 1:
-                    grad_w = self.w[:]
-                    grad_b = 0.0
+            z = X @ self.w + self.b
+            p = self._sigmoid(z)
+            grad_w = (X.T @ (p - y))/n + self.l2*self.w
+            grad_b = np.mean(p - y)
+            self.w -= self.lr * grad_w
+            self.b -= self.lr * grad_b
+        return self
+    def predict_proba(self, X):
+        X = np.asarray(X)
+        z = X @ self.w + self.b
+        p = self._sigmoid(z)
+        return np.vstack([1-p, p]).T
+    def predict(self, X):
+        p = self.predict_proba(X)[:,1]
+        return (p >= 0.5).astype(int)
+
+# ---------- Linear SVM via Pegasos ----------
+class LinearSVMScratch:
+    def __init__(self, C=1.0, epochs=20, random_state=42):
+        self.C = C
+        self.epochs = epochs
+        self.w = None
+        self.b = 0.0
+        self.rng = np.random.default_rng(random_state)
+    def fit(self, X, y):
+        # y in {0,1} -> map to {-1, +1}
+        X = np.asarray(X); y = np.asarray(y)
+        y2 = np.where(y==1, 1.0, -1.0)
+        n, d = X.shape
+        self.w = np.zeros(d); self.b = 0.0
+        t = 0
+        for _ in range(self.epochs):
+            idx = self.rng.permutation(n)
+            for i in idx:
+                t += 1
+                eta = 1.0/(self.C * t)
+                if y2[i]*(X[i] @ self.w + self.b) < 1:
+                    self.w = (1 - eta*self.C)*self.w + eta*y2[i]*X[i]
+                    self.b = self.b + eta*y2[i]
                 else:
-                    grad_w = [self.w[j] - self.C*yi*xi[j] for j in range(d)]
-                    grad_b = -self.C*yi
-                # step
-                for j in range(d):
-                    self.w[j] -= self.lr*grad_w[j]
-                self.b -= self.lr*grad_b
+                    self.w = (1 - eta*self.C)*self.w
+        return self
     def decision_function(self, X):
-        return [dot(self.w, xi)+self.b for xi in X]
+        X = np.asarray(X)
+        return X @ self.w + self.b
     def predict(self, X):
-        return [1 if s>=0 else 0 for s in self.decision_function(X)]
+        return (self.decision_function(X) >= 0).astype(int)
+
+# ---------- Voting ----------
+class VotingClassifierScratch:
+    def __init__(self, estimators, voting="hard", weights=None):
+        self.estimators = estimators  # list of (name, model)
+        self.voting = voting
+        self.weights = np.array(weights) if weights is not None else None
+    def fit(self, X, y):
+        for _, m in self.estimators:
+            m.fit(X, y)
+        return self
+    def predict(self, X):
+        if self.voting == "hard":
+            preds = np.column_stack([m.predict(X) for _, m in self.estimators])
+            if self.weights is None:
+                votes = preds.mean(axis=1)
+            else:
+                votes = (preds * self.weights).sum(axis=1) / self.weights.sum()
+            return (votes >= 0.5).astype(int)
+        else:
+            probas = []
+            for _, m in self.estimators:
+                if hasattr(m, "predict_proba"):
+                    probas.append(m.predict_proba(X)[:,1])
+                elif hasattr(m, "decision_function"):
+                    # scale decision to [0,1] via sigmoid-ish
+                    d = m.decision_function(X)
+                    p = 1/(1+np.exp(-d))
+                    probas.append(p)
+                else:
+                    probas.append(m.predict(X).astype(float))
+            probas = np.column_stack(probas)
+            if self.weights is None:
+                avg = probas.mean(axis=1)
+            else:
+                avg = (probas * self.weights).sum(axis=1) / self.weights.sum()
+            return (avg >= 0.5).astype(int)
     def predict_proba(self, X):
-        # Not calibrated; squash with logistic for visualization
-        scores = self.decision_function(X)
-        probs=[]
-        for s in scores:
-            p = 1/(1+math.exp(-s))
-            probs.append([1-p, p])
-        return probs
+        # For soft voting display
+        probas = []
+        for _, m in self.estimators:
+            if hasattr(m, "predict_proba"):
+                probas.append(m.predict_proba(X)[:,1])
+            elif hasattr(m, "decision_function"):
+                d = m.decision_function(X)
+                probas.append(1/(1+np.exp(-d)))
+            else:
+                probas.append(m.predict(X).astype(float))
+        probas = np.column_stack(probas)
+        avg = probas.mean(axis=1)
+        return np.vstack([1-avg, avg]).T
 
-# --------------------------- Metrics & Curves ---------------------------
+# =========================
+# Data pipeline (cached)
+# =========================
+@st.cache_data
+def get_clean_scaled_data():
+    df = pd.read_csv("heart.csv").drop_duplicates().dropna()
+    # remove outliers on selected continuous cols
+    cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
+    mask = np.zeros(len(df), dtype=bool)
+    for c in cont_cols:
+        mask |= iqr_mask(df[c].values)
+    df = df.loc[~mask].copy()
 
-def confusion_matrix(y_true, y_pred):
-    tp=fp=tn=fn=0
-    for yt, yp in zip(y_true, y_pred):
-        if yt==1 and yp==1: tp+=1
-        elif yt==0 and yp==1: fp+=1
-        elif yt==0 and yp==0: tn+=1
-        else: fn+=1
-    return tn, fp, fn, tp
+    X = df.drop("target", axis=1).values.astype(float)
+    y = df["target"].values.astype(int)
 
-def precision_recall_f1(y_true, y_pred):
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred)
-    prec = tp/(tp+fp) if (tp+fp)>0 else 0.0
-    rec  = tp/(tp+fn) if (tp+fn)>0 else 0.0
-    acc  = (tp+tn)/max(1,len(y_true))
-    f1   = 2*prec*rec/(prec+rec) if (prec+rec)>0 else 0.0
-    return acc, prec, rec, f1, (tn,fp,fn,tp)
+    mean, std = standardize_fit(X)
+    X_scaled = standardize_transform(X, mean, std)
 
-def roc_curve_points(y_true, y_scores):
-    # Threshold sweep over sorted unique scores
-    pairs = sorted([(s, yt) for s,yt in zip(y_scores, y_true)], key=lambda t:t[0])
-    uniq = sorted(set(y_scores))
-    if not uniq: return [0.0],[0.0],[]
-    fprs=[]; tprs=[]; ths=[]
-    P = sum(1 for v in y_true if v==1)
-    N = sum(1 for v in y_true if v==0)
-    for thr in uniq:
-        tp = sum(1 for s,y in pairs if s>=thr and y==1)
-        fp = sum(1 for s,y in pairs if s>=thr and y==0)
-        fn = P - tp
-        tn = N - fp
-        fpr = fp/max(1,N); tpr = tp/max(1,P)
-        fprs.append(fpr); tprs.append(tpr); ths.append(thr)
-    # prepend (0,0) and append (1,1) for nicer shape
-    if (0.0,0.0) not in zip(fprs,tprs):
-        fprs=[0.0]+fprs; tprs=[0.0]+tprs
-    if (1.0,1.0) not in zip(fprs,tprs):
-        fprs=fprs+[1.0]; tprs=tprs+[1.0]
-    return fprs, tprs, ths
+    X_train, X_test, y_train, y_test = stratified_train_test_split(
+        X_scaled, y, test_size=0.2, random_state=42
+    )
 
-def auc_trapezoid(xs, ys):
-    # assumes xs sorted increasing
-    area=0.0
-    for i in range(1,len(xs)):
-        area += (xs[i]-xs[i-1])*(ys[i]+ys[i-1])/2
-    return area
+    X_train_smote, y_train_smote = simple_smote(X_train, y_train, k=5, random_state=42)
 
-# --------------------------- Small SVG helpers ---------------------------
+    return X_train_smote, X_test, y_train_smote, y_test, list(df.drop("target", axis=1).columns), mean, std
 
-def svg_bar_chart(data_pairs, title="", width=700, height=300, max_val=1.0):
-    # data_pairs: [(label, value), ...]
-    pad=40
-    bar_w = (width-2*pad)/max(1,len(data_pairs))
-    svg = [f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">']
-    svg.append(f'<text x="{width/2}" y="20" font-size="16" text-anchor="middle">{title}</text>')
-    # axes
-    svg.append(f'<line x1="{pad}" y1="{height-pad}" x2="{width-pad}" y2="{height-pad}" stroke="black"/>')
-    svg.append(f'<line x1="{pad}" y1="{pad}" x2="{pad}" y2="{height-pad}" stroke="black"/>')
-    # bars
-    for i,(lab,val) in enumerate(data_pairs):
-        h = (height-2*pad) * (max(0.0, min(val, max_val)) / max_val)
-        x = pad + i*bar_w + 5
-        y = height - pad - h
-        svg.append(f'<rect x="{x}" y="{y}" width="{bar_w-10}" height="{h}" fill="steelblue" />')
-        svg.append(f'<text x="{x+bar_w/2-5}" y="{height-pad+15}" font-size="10" text-anchor="middle" transform="rotate(15 {x+bar_w/2-5},{height-pad+15})">{lab}</text>')
-        svg.append(f'<text x="{x+bar_w/2-5}" y="{y-5}" font-size="10" text-anchor="middle">{val:.3f}</text>')
-    svg.append('</svg>')
-    return "\n".join(svg)
+st.set_page_config(page_title="Heart Disease Predictor", layout="wide")
 
-def svg_confusion_matrix(tn, fp, fn, tp, title="Confusion Matrix", width=360, height=260):
-    pad=30; cell=100
-    svg=[f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">']
-    svg.append(f'<text x="{width/2}" y="20" font-size="16" text-anchor="middle">{title}</text>')
-    # grid
-    x0=pad; y0=50
-    labels=[("TN",tn),("FP",fp),("FN",fn),("TP",tp)]
-    for i in range(2):
-        for j in range(2):
-            idx = i*2+j
-            x = x0 + j*cell
-            y = y0 + i*cell
-            svg.append(f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" fill="#e8eef9" stroke="#1f4aa8"/>')
-            svg.append(f'<text x="{x+cell/2}" y="{y+40}" font-size="14" text-anchor="middle">{labels[idx][0]}</text>')
-            svg.append(f'<text x="{x+cell/2}" y="{y+70}" font-size="14" text-anchor="middle">{labels[idx][1]}</text>')
-    svg.append(f'<text x="{x0+cell}" y="{y0+2*cell+30}" font-size="12" text-anchor="middle">Predicted 0    1</text>')
-    svg.append(f'<text x="{x0-10}" y="{y0+cell}" font-size="12" text-anchor="end" transform="rotate(-90 {x0-10},{y0+cell})">Actual 0    1</text>')
-    svg.append('</svg>')
-    return "\n".join(svg)
+# ========== Sidebar ==========
+st.sidebar.title("🫀 Heart Disease Comparison")
+st.sidebar.markdown("Upload your dataset and explore model performance.📊")
 
-def svg_pie_chart(values, labels, title="", width=360, height=260):
-    total = sum(values) if values else 1
-    cx, cy, r = width//2, height//2+10, min(width,height)//3
-    colors = ["#4e79a7","#f28e2b","#e15759","#76b7b2","#59a14f","#edc949"]
-    svg=[f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">']
-    svg.append(f'<text x="{width/2}" y="20" font-size="16" text-anchor="middle">{title}</text>')
-    angle=0.0
-    for i,v in enumerate(values):
-        frac = v/total
-        sweep = frac*2*math.pi
-        x1 = cx + r*math.cos(angle)
-        y1 = cy + r*math.sin(angle)
-        angle2 = angle + sweep
-        x2 = cx + r*math.cos(angle2)
-        y2 = cy + r*math.sin(angle2)
-        large = 1 if sweep>math.pi else 0
-        path = f"M {cx},{cy} L {x1},{y1} A {r},{r} 0 {large},1 {x2},{y2} z"
-        svg.append(f'<path d="{path}" fill="{colors[i%len(colors)]}"></path>')
-        # label
-        mid = angle + sweep/2
-        lx = cx + (r+18)*math.cos(mid)
-        ly = cy + (r+18)*math.sin(mid)
-        svg.append(f'<text x="{lx}" y="{ly}" font-size="12" text-anchor="middle">{labels[i]} ({v})</text>')
-        angle = angle2
-    svg.append('</svg>')
-    return "\n".join(svg)
+uploaded_file = st.sidebar.file_uploader("Upload CSV file", type=["csv"])
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
+else:
+    df = pd.read_csv("heart.csv")
 
-def svg_roc(fprs, tprs, auc_val, width=360, height=260, title="ROC Curve"):
-    pad=35
-    svg=[f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">']
-    svg.append(f'<text x="{width/2}" y="18" font-size="16" text-anchor="middle">{title} (AUC={auc_val:.2f})</text>')
-    # axes
-    x0=pad; y0=height-pad; x1=width-pad; y1=pad
-    svg.append(f'<line x1="{x0}" y1="{y0}" x2="{x1}" y2="{y0}" stroke="black"/>')
-    svg.append(f'<line x1="{x0}" y1="{y0}" x2="{x0}" y2="{y1}" stroke="black"/>')
-    # diagonal
-    svg.append(f'<line x1="{x0}" y1="{y0}" x2="{x1}" y2="{y1}" stroke="#999" stroke-dasharray="4,4"/>')
-    # polyline
-    pts=[]
-    for f,t in zip(fprs,tprs):
-        xp = x0 + (x1-x0)*f
-        yp = y0 - (y0-y1)*t
-        pts.append(f"{xp},{yp}")
-    svg.append(f'<polyline fill="none" stroke="#1f77b4" stroke-width="2" points="{" ".join(pts)}"/>')
-    svg.append(f'<text x="{(x0+x1)/2}" y="{y0+25}" font-size="12" text-anchor="middle">False Positive Rate</text>')
-    svg.append(f'<text x="{x0-25}" y="{(y0+y1)/2}" font-size="12" text-anchor="middle" transform="rotate(-90 {x0-25},{(y0+y1)/2})">True Positive Rate</text>')
-    svg.append('</svg>')
-    return "\n".join(svg)
+st.sidebar.write(f"Dataset shape: {df.shape}")
 
-# --------------------------- App ---------------------------
+# ========== Page Tabs ==========
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🔍 Preprocessing",
+    "🪭 KNN", 
+    "👙 Logistic Regression", 
+    "👟 SVM", 
+    "📊 Model Comparison"
+])
 
-st.set_page_config(page_title="Heart Disease Predictor (No External Libs)", layout="wide")
-st.sidebar.title("🫀 Heart Disease Comparison (No-Dependency Edition)")
-st.sidebar.markdown("Upload CSV (with a 'target' column). All processing & ML are from scratch.")
-
-uploaded = st.sidebar.file_uploader("Upload CSV file", type=["csv"])
-try:
-    rows = read_csv_as_rows(uploaded) if uploaded else read_csv_as_rows("heart.csv")
-except Exception as e:
-    st.error(f"Failed to read CSV: {e}")
-    st.stop()
-
-rows = coerce_numeric(rows)
-orig_shape = (len(rows), len(rows[0]) if rows else 0)
-
-st.sidebar.write(f"Dataset shape: {orig_shape}")
-
-tabs = st.tabs(["🔍 Preprocessing", "🪭 KNN", "👙 Logistic Regression", "👟 SVM", "📊 Model Comparison"])
-
-# ---------- Tab 1: Preprocessing ----------
-with tabs[0]:
+with tab1:
     st.header("🔍 Preprocessing: Missing Values, Outlier, Overfitting")
 
-    # Preview (first 5)
-    st.subheader("📊 Dataset Preview (first 5 rows)")
-    if rows:
-        header = list(rows[0].keys())
-        preview = [rows[i] for i in range(min(5, len(rows)))]
-        st.table(preview)
-    else:
-        st.warning("Empty dataset.")
+    st.subheader("📊 Dataset Preview")
+    st.dataframe(df.head())
 
-    # Info-like
     st.subheader("📈 Dataset Information")
-    dtype_info = {}
-    for k in (rows[0].keys() if rows else []):
-        kinds = set(type(r[k]).__name__ for r in rows)
-        dtype_info[k] = ", ".join(sorted(kinds))
-    info_text = io.StringIO()
-    info_text.write("Columns and detected Python types:\n")
-    for k, t in dtype_info.items():
-        info_text.write(f"- {k}: {t}\n")
-    st.text(info_text.getvalue())
+    buffer = io.StringIO()
+    df.info(buf=buffer)
+    info_str = buffer.getvalue()
+    st.text(info_str)
 
-    # Data Types, Unique, Missing
-    st.subheader("🧬 Data Types and Unique/Missing")
-    stats_rows = []
-    for k in (rows[0].keys() if rows else []):
-        vals = [r[k] for r in rows]
-        uniq = len(set(vals))
-        miss = sum(1 for v in vals if v is None)
-        kinds = ", ".join(sorted(set(type(v).__name__ for v in vals)))
-        stats_rows.append({"Column":k, "Types":kinds, "Unique":uniq, "Missing":miss})
-    st.table(stats_rows)
+    st.subheader("🧬 Data Types and Unique Values")
+    feature_info = pd.DataFrame({
+        "Data Type": df.dtypes,
+        "Unique Values": df.nunique(),
+        "Missing Values": df.isnull().sum()
+    })
+    st.dataframe(feature_info)
 
-    # Summary statistics
-    st.subheader("🔢 Summary Statistics (numeric)")
-    num_cols = [k for k in (rows[0].keys() if rows else []) if all((isinstance(r[k], (int,float)) or r[k] is None) for r in rows) and k!="target"]
-    ss = column_stats(rows, num_cols)
-    sumtab = [{"Feature":k, **ss[k]} for k in num_cols]
-    st.table(sumtab)
+    st.subheader("🔢 Summary Statistics")
+    st.dataframe(df.describe())
 
-    # Target pie
     st.subheader("🧩 Target Distribution (Pie Chart)")
-    target_vals = [int(r["target"]) for r in rows if r.get("target") is not None]
-    zeros = sum(1 for v in target_vals if v==0)
-    ones  = sum(1 for v in target_vals if v==1)
-    pie_svg = svg_pie_chart([zeros, ones], ["No Heart Disease","Heart Disease"], title="Target")
-    st.markdown(pie_svg, unsafe_allow_html=True)
+    target_counts = df['target'].value_counts()
+    labels = ['No Heart Disease' if i == 0 else 'Heart Disease' for i in target_counts.index]
+    sizes = target_counts.values
+    if len(sizes) > 0:
+        fig, ax = plt.subplots()
+        ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+        ax.axis('equal')
+        st.pyplot(fig)
+    else:
+        st.warning("⚠️ No data available to display the pie chart.")
 
-    # Cleaning
+    # ==================== DATA CLEANING ====================
     st.subheader("Clean the Dataset")
-    original_rows = len(rows)
-    rows_nodup = drop_duplicates(rows)
-    duplicate_count = original_rows - len(rows_nodup)
 
-    rows_nomiss = dropna_rows(rows_nodup)
-    missing_count = len(rows_nodup) - len(rows_nomiss)
+    original_rows = df.shape[0]
+    duplicate_count = df.duplicated().sum()
+    df = df.drop_duplicates()
+    missing_count = df.isnull().sum().sum()
+    df = df.dropna()
 
-    cont_cols_for_outliers = [c for c in ["age","trestbps","thalach","oldpeak"] if c in (rows_nomiss[0].keys() if rows_nomiss else [])]
-    rows_clean, outlier_count = remove_outliers_iqr(rows_nomiss, cont_cols_for_outliers)
-    final_rows = len(rows_clean)
+    continuous_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
+    outlier_mask = pd.Series([False] * df.shape[0], index=df.index)
+    for col in continuous_cols:
+        outlier_mask = outlier_mask | pd.Series(iqr_mask(df[col].values), index=df.index)
+    outlier_count = int(outlier_mask.sum())
+    df = df.loc[~outlier_mask].copy()
+    final_rows = df.shape[0]
 
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Original", original_rows)
-    c2.metric("Duplicates", duplicate_count)
-    c3.metric("Missing", missing_count)
-    c4.metric("Outliers", outlier_count)
-    c5.metric("Final Rows", final_rows)
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Original", original_rows)
+    col2.metric("Duplicates", int(duplicate_count))
+    col3.metric("Missing", int(missing_count))
+    col4.metric("Outliers", outlier_count)
+    col5.metric("Final Rows", final_rows)
 
-    with st.expander("📄 View Cleaned Data (first 10)"):
-        st.table(rows_clean[:10])
+    with st.expander("📄 View Cleaned Data"):
+        st.dataframe(df)
 
-# Shared preprocessed set for training tabs
-# (Re-run simple pipeline here to keep statelessness tidy)
-rows_proc = dropna_rows(drop_duplicates(rows))
-rows_proc, _ = remove_outliers_iqr(rows_proc, [c for c in ["age","trestbps","thalach","oldpeak"] if rows_proc and c in rows_proc[0]])
-if not rows_proc:
-    st.stop()
-X, y, feature_names = split_Xy(rows_proc, target="target")
-mu, sd = zscore_fit(X)
-X_scaled = zscore_transform(X, mu, sd)
-X_train, X_test, y_train, y_test = stratified_train_test_split(X_scaled, y, test_size=0.2, seed=42)
-X_train_bal, y_train_bal = simple_balance_duplicate(X_train, y_train, seed=42)
+    st.subheader("🔁 Multicollinearity Check (VIF)")
+    X_vif = df.drop("target", axis=1).values.astype(float)
+    mean_v, std_v = standardize_fit(X_vif)
+    X_vif_scaled = standardize_transform(X_vif, mean_v, std_v)
+    vif_df = vif_table(X_vif_scaled, df.drop("target", axis=1).columns.tolist())
+    st.dataframe(vif_df)
 
-# ---------- Tab 2: KNN ----------
-with tabs[1]:
+    # ==================== SMOTE + SCALING ====================
+    st.subheader("Apply SMOTE and Standardization")
+    X_all = df.drop("target", axis=1).values.astype(float)
+    y_all = df["target"].values.astype(int)
+    mean_all, std_all = standardize_fit(X_all)
+    X_scaled_all = standardize_transform(X_all, mean_all, std_all)
+    X_balanced, y_balanced = simple_smote(X_scaled_all, y_all, k=5, random_state=42)
+
+    st.subheader("⚖️ Class Distribution Before & After SMOTE")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Before SMOTE")
+        fig1, ax1 = plt.subplots()
+        sns.countplot(x=pd.Series(y_all, name="target"), ax=ax1)
+        st.pyplot(fig1)
+    with col2:
+        st.markdown("### After SMOTE")
+        fig2, ax2 = plt.subplots()
+        sns.countplot(x=pd.Series(y_balanced, name="target"), ax=ax2)
+        st.pyplot(fig2)
+
+with tab2:
     st.header("🧠 KNN Pipeline")
 
+    # Use the balanced/scaled data from the cleaning block above
+    # Recreate to keep the tab independent
+    df_knn = (pd.read_csv(uploaded_file) if uploaded_file else pd.read_csv("heart.csv")).drop_duplicates().dropna()
+    cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
+    mask = np.zeros(len(df_knn), dtype=bool)
+    for c in cont_cols:
+        mask |= iqr_mask(df_knn[c].values)
+    df_knn = df_knn.loc[~mask].copy()
+
+    X_all = df_knn.drop("target", axis=1).values.astype(float)
+    y_all = df_knn["target"].values.astype(int)
+    mean_all, std_all = standardize_fit(X_all)
+    X_scaled_all = standardize_transform(X_all, mean_all, std_all)
+    X_balanced, y_balanced = simple_smote(X_scaled_all, y_all, k=5, random_state=42)
+
+    # ==================== BEST K SEARCH ====================
     st.subheader("Find Best K for KNN")
-    k_range = list(range(1, 21))
-    # 5-fold CV (stratified)
-    def kfold_indices(y, k=5, seed=42):
-        random.seed(seed)
-        idx0 = [i for i,t in enumerate(y) if t==0]
-        idx1 = [i for i,t in enumerate(y) if t==1]
-        random.shuffle(idx0); random.shuffle(idx1)
-        folds0 = [idx0[i::k] for i in range(k)]
-        folds1 = [idx1[i::k] for i in range(k)]
-        folds = [sorted(folds0[i]+folds1[i]) for i in range(k)]
-        return folds
+    k_range = range(1, 21)
+    cv_scores = []
+    folds = stratified_kfold_indices(y_balanced, n_splits=10, shuffle=True, random_state=42)
+    for k in k_range:
+        acc_fold = []
+        for i in range(10):
+            val_idx = folds[i]
+            train_idx = np.setdiff1d(np.arange(len(y_balanced)), val_idx)
+            knn = KNNClassifier(n_neighbors=k).fit(X_balanced[train_idx], y_balanced[train_idx])
+            y_pred_val = knn.predict(X_balanced[val_idx])
+            acc_fold.append(accuracy_score_np(y_balanced[val_idx], y_pred_val))
+        cv_scores.append(np.mean(acc_fold))
+    best_k = list(k_range)[int(np.argmax(cv_scores))]
+    best_score = np.max(cv_scores)
 
-    folds = kfold_indices(y_train_bal, k=5, seed=42)
-    cv_scores=[]
-    for K in k_range:
-        accs=[]
-        for i in range(5):
-            val_idx = set(folds[i])
-            Xtr = [X_train_bal[j] for j in range(len(X_train_bal)) if j not in val_idx]
-            ytr = [y_train_bal[j] for j in range(len(y_train_bal)) if j not in val_idx]
-            Xva = [X_train_bal[j] for j in range(len(X_train_bal)) if j in val_idx]
-            yva = [y_train_bal[j] for j in range(len(y_train_bal)) if j in val_idx]
-            clf = KNN(k=K); clf.fit(Xtr,ytr)
-            yp = clf.predict(Xva)
-            acc,_,_,_,_ = precision_recall_f1(yva, yp)
-            accs.append(acc)
-        cv_scores.append(sum(accs)/len(accs) if accs else 0.0)
-    best_idx = max(range(len(cv_scores)), key=lambda i: cv_scores[i])
-    best_k = k_range[best_idx]
-    best_score = cv_scores[best_idx]
+    fig, ax = plt.subplots()
+    ax.plot(list(k_range), cv_scores, marker='o')
+    ax.set_xlabel("Number of Neighbors (K)")
+    ax.set_ylabel("Cross-Validated Accuracy")
+    ax.set_title("KNN Accuracy vs. K")
+    ax.grid(True)
+    st.pyplot(fig)
 
-    # Show CV scores bar
-    st.markdown(svg_bar_chart([(str(k), s) for k,s in zip(k_range, cv_scores)],
-                              title="KNN Accuracy vs K (CV, 5-fold)"), unsafe_allow_html=True)
     st.success(f"🏆 Best K = **{best_k}** with Accuracy = **{best_score:.4f}**")
 
-    # Train best K and evaluate on test
-    knn = KNN(k=best_k)
-    knn.fit(X_train_bal, y_train_bal)
-    y_pred = knn.predict(X_test)
+    # ==================== TRAIN/TEST ====================
+    mean_t, std_t = standardize_fit(X_all)
+    X_scaled = standardize_transform(X_all, mean_t, std_t)
+    X_train, X_test, y_train, y_test = stratified_train_test_split(X_scaled, y_all, test_size=0.2, random_state=42)
+    X_train_smote, y_train_smote = simple_smote(X_train, y_train, k=5, random_state=42)
 
+    model = KNNClassifier(n_neighbors=best_k).fit(X_train_smote, y_train_smote)
+    y_pred = model.predict(X_test)
+
+    # ==================== EVALUATION ====================
     st.subheader("Evaluation Metrics")
-    acc, prec, rec, f1, (tn,fp,fn,tp) = precision_recall_f1(y_test, y_pred)
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Accuracy", f"{acc:.2f}")
-    c2.metric("Precision", f"{prec:.2f}")
-    c3.metric("Recall", f"{rec:.2f}")
-    c4.metric("F1 Score", f"{f1:.2f}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Accuracy", f"{accuracy_score_np(y_test, y_pred):.2f}")
+    c2.metric("Precision", f"{precision_score_np(y_test, y_pred):.2f}")
+    c3.metric("Recall", f"{recall_score_np(y_test, y_pred):.2f}")
+    c4.metric("F1 Score", f"{f1_score_np(y_test, y_pred):.2f}")
 
-    st.markdown(svg_confusion_matrix(tn,fp,fn,tp, title="Confusion Matrix - KNN"), unsafe_allow_html=True)
+    with st.expander("📄 Classification Report"):
+        st.code(classification_report_np(y_test, y_pred), language="text")
 
-# ---------- Tab 3: Logistic Regression ----------
-with tabs[2]:
+    # Confusion Matrix (custom plot)
+    cm = confusion_matrix_np(y_test, y_pred)
+    fig, ax = plt.subplots()
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_title("Confusion Matrix - KNN")
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(["No Disease", "Disease"])
+    ax.set_yticklabels(["No Disease", "Disease"])
+    for (i,j), v in np.ndenumerate(cm):
+        ax.text(j, i, str(v), ha='center', va='center')
+    plt.colorbar(im, ax=ax)
+    st.pyplot(fig)
+
+with tab3:
     st.header("📈 Logistic Regression Analysis")
 
-    # Simple "before vs after scaling" visualization (std dev text)
-    st.subheader("📊 Feature Scaling (Summary)")
-    before_stats = column_stats(rows_proc, feature_names)
-    after_stats = column_stats(
-        [{feature_names[j]: X_scaled[i][j] for j in range(len(feature_names))} for i in range(len(X_scaled))],
-        feature_names
-    )
-    scale_table = []
-    for f in feature_names:
-        bs = before_stats[f]; as_ = after_stats[f]
-        scale_table.append({
-            "Feature": f,
-            "Mean (before)": f"{(bs['mean'] or 0):.3f}",
-            "Std (before)": f"{(bs['std'] or 0):.3f}",
-            "Mean (after)": f"{(as_['mean'] or 0):.3f}",
-            "Std (after)": f"{(as_['std'] or 0):.3f}",
-        })
-    st.table(scale_table[:10])
+    df_lr = (pd.read_csv(uploaded_file) if uploaded_file else pd.read_csv("heart.csv")).drop_duplicates().dropna()
 
-    # Train
-    logreg = LogisticRegressionGD(lr=0.05, epochs=500, l2=0.001)
-    logreg.fit(X_train_bal, y_train_bal)
-    y_pred = logreg.predict(X_test)
+    # --- 1. Correlation Matrix ---
+    st.subheader("🔍 Correlation Matrix")
+    fig_corr, ax_corr = plt.subplots(figsize=(10, 8))
+    sns.heatmap(df_lr.corr(numeric_only=True), annot=True, cmap="coolwarm", fmt=".2f", ax=ax_corr)
+    st.pyplot(fig_corr)
 
-    acc, prec, rec, f1, (tn,fp,fn,tp) = precision_recall_f1(y_test, y_pred)
+    # --- 2. Feature Scaling Visualization ---
+    st.subheader("📊 Feature Scaling (Before vs After)")
+    features = ['age', 'trestbps', 'chol', 'thalach', 'oldpeak']
+    original_data = df_lr[features].values.astype(float)
+    m0, s0 = standardize_fit(original_data)
+    scaled_df = standardize_transform(original_data, m0, s0)
+    fig_scale, axs = plt.subplots(2, 3, figsize=(16, 8))
+    axs = axs.flatten()
+    for i, col in enumerate(features):
+        sns.kdeplot(original_data[:, i], label='Before Scaling', ax=axs[i])
+        sns.kdeplot(scaled_df[:, i], label='After Scaling', ax=axs[i])
+        axs[i].set_title(col)
+        axs[i].legend()
+    axs[-1].axis('off')
+    st.pyplot(fig_scale)
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Accuracy", f"{acc:.2f}")
-    c2.metric("Precision", f"{prec:.2f}")
-    c3.metric("Recall", f"{rec:.2f}")
-    c4.metric("F1 Score", f"{f1:.2f}")
+    # --- 3. Data Cleaning ---
+    st.subheader("")
+    original_rows = df_lr.shape[0]
+    duplicate_count = df_lr.duplicated().sum()
+    df_lr = df_lr.drop_duplicates()
+    missing_count = df_lr.isnull().sum().sum()
+    df_lr = df_lr.dropna()
 
-    # "Classification report" text
-    report = f"""precision    recall  f1-score  support
-0       {(tn/(tn+fp) if (tn+fp)>0 else 0):.2f}     {(tn/(tn+fn) if (tn+fn)>0 else 0):.2f}    {0:.2f}      {tn+fn}
-1       {prec:.2f}     {rec:.2f}    {f1:.2f}      {tp+fp}
-accuracy                        {acc:.2f}      {len(y_test)}
-"""
+    cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
+    mask = np.zeros(len(df_lr), dtype=bool)
+    for c in cont_cols:
+        mask |= iqr_mask(df_lr[c].values)
+    df_lr = df_lr.loc[~mask].copy()
+    cleaned_rows = df_lr.shape[0]
+
+    # --- 4. Model Training ---
+    st.subheader("")
+    X = df_lr.drop("target", axis=1).values.astype(float)
+    y = df_lr["target"].values.astype(int)
+    mean_s, std_s = standardize_fit(X)
+    X_scaled = standardize_transform(X, mean_s, std_s)
+
+    X_train, X_test, y_train, y_test = stratified_train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    X_train_smote, y_train_smote = simple_smote(X_train, y_train, k=5, random_state=42)
+
+    model = LogisticRegressionScratch(lr=0.1, epochs=2000, l2=0.001, random_state=42).fit(X_train_smote, y_train_smote)
+    y_pred = model.predict(X_test)
+
+    # --- 5. Evaluation ---
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Accuracy", f"{accuracy_score_np(y_test, y_pred):.2f}")
+    c2.metric("Precision", f"{precision_score_np(y_test, y_pred):.2f}")
+    c3.metric("Recall", f"{recall_score_np(y_test, y_pred):.2f}")
+    c4.metric("F1 Score", f"{f1_score_np(y_test, y_pred):.2f}")
+
     with st.expander("📄 Classification Report"):
-        st.code(report, language="text")
+        st.code(classification_report_np(y_test, y_pred), language="text")
 
-    st.markdown(svg_confusion_matrix(tn,fp,fn,tp, title="Confusion Matrix - Logistic Regression"), unsafe_allow_html=True)
+    cm = confusion_matrix_np(y_test, y_pred)
+    fig, ax = plt.subplots()
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_title("Confusion Matrix - Logistic Regression")
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(["No Disease", "Disease"])
+    ax.set_yticklabels(["No Disease", "Disease"])
+    for (i,j), v in np.ndenumerate(cm):
+        ax.text(j, i, str(v), ha='center', va='center')
+    plt.colorbar(im, ax=ax)
+    st.pyplot(fig)
 
-# ---------- Tab 4: SVM ----------
-with tabs[3]:
-    st.header("🧠 Support Vector Machine (Linear, Hinge-Loss SGD)")
+with tab4:
+    st.header("🧠 Support Vector Machine (SVM) Classification")
+    X_train_smote, X_test, y_train_smote, y_test, feature_names, mean_glob, std_glob = get_clean_scaled_data()
 
-    svm = LinearSVM_SGD(lr=0.01, epochs=8, C=1.0)  # small epochs to keep snappy
-    svm.fit(X_train_bal, y_train_bal)
-    y_pred = svm.predict(X_test)
+    svm_model = LinearSVMScratch(C=1.0, epochs=20, random_state=42).fit(X_train_smote, y_train_smote)
+    y_pred = svm_model.predict(X_test)
 
-    acc, prec, rec, f1, (tn,fp,fn,tp) = precision_recall_f1(y_test, y_pred)
     st.subheader("📊 Evaluation Metrics")
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Accuracy", f"{acc:.2f}")
-    c2.metric("Precision", f"{prec:.2f}")
-    c3.metric("Recall", f"{rec:.2f}")
-    c4.metric("F1 Score", f"{f1:.2f}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Accuracy", f"{accuracy_score_np(y_test, y_pred):.2f}")
+    c2.metric("Precision", f"{precision_score_np(y_test, y_pred):.2f}")
+    c3.metric("Recall", f"{recall_score_np(y_test, y_pred):.2f}")
+    c4.metric("F1 Score", f"{f1_score_np(y_test, y_pred):.2f}")
 
-    # "Classification report"
-    report = f"""precision    recall  f1-score  support
-0       {(tn/(tn+fp) if (tn+fp)>0 else 0):.2f}     {(tn/(tn+fn) if (tn+fn)>0 else 0):.2f}    {0:.2f}      {tn+fn}
-1       {prec:.2f}     {rec:.2f}    {f1:.2f}      {tp+fp}
-accuracy                        {acc:.2f}      {len(y_test)}
-"""
     st.text("📄 Classification Report")
-    st.code(report, language="text")
+    st.code(classification_report_np(y_test, y_pred), language='text')
 
+    # Confusion Matrix
     st.subheader("📉 Confusion Matrix")
-    st.markdown(svg_confusion_matrix(tn,fp,fn,tp, title="Confusion Matrix - SVM"), unsafe_allow_html=True)
+    cm = confusion_matrix_np(y_test, y_pred)
+    fig, ax = plt.subplots()
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_title("Confusion Matrix - SVM")
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(["No Disease", "Disease"])
+    ax.set_yticklabels(["No Disease", "Disease"])
+    for (i,j), v in np.ndenumerate(cm):
+        ax.text(j, i, str(v), ha='center', va='center')
+    plt.colorbar(im, ax=ax)
+    st.pyplot(fig)
 
-    # Simple ROC using raw decision scores
-    st.subheader("🎯 ROC (uncalibrated scores)")
-    scores = [s for s in svm.decision_function(X_test)]
-    fprs, tprs, _ = roc_curve_points(y_test, scores)
-    aucv = auc_trapezoid(sorted(fprs), [y for _,y in sorted(zip(fprs,tprs))])
-    st.markdown(svg_roc(fprs, tprs, aucv, title="ROC Curve - SVM"), unsafe_allow_html=True)
+    st.subheader("🎯 SVM Decision Boundary (PCA Projection)")
+    X_pca, comps, _ = pca_fit_transform(X_train_smote, n_components=2)
+    y_train_vis = y_train_smote
 
-# ---------- Tab 5: Model Comparison ----------
-with tabs[4]:
-    st.header("📊 Model Comparison (with Simple Voting)")
+    svm_vis = LinearSVMScratch(C=1.0, epochs=30, random_state=1).fit(X_pca, y_train_vis)
 
-    # Train all
-    knn = KNN(k=5); knn.fit(X_train_bal, y_train_bal)
-    logreg = LogisticRegressionGD(lr=0.05, epochs=500, l2=0.001); logreg.fit(X_train_bal, y_train_bal)
-    svm = LinearSVM_SGD(lr=0.01, epochs=8, C=1.0); svm.fit(X_train_bal, y_train_bal)
+    x_min, x_max = X_pca[:, 0].min() - 1, X_pca[:, 0].max() + 1
+    y_min, y_max = X_pca[:, 1].min() - 1, X_pca[:, 1].max() + 1
+    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 500),
+                         np.linspace(y_min, y_max, 500))
+    grid = np.c_[xx.ravel(), yy.ravel()]
+    Z = svm_vis.predict(grid).reshape(xx.shape)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.contourf(xx, yy, Z, cmap=plt.cm.coolwarm, alpha=0.3)
+    scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=y_train_vis, cmap=plt.cm.coolwarm, edgecolors='k')
+    legend_labels = ['No Disease', 'Heart Disease']
+    ax.legend(handles=scatter.legend_elements()[0], labels=legend_labels)
+    ax.set_title("SVM Decision Boundary (Training Data in PCA Space)")
+    ax.set_xlabel("PCA Component 1")
+    ax.set_ylabel("PCA Component 2")
+    ax.grid(True)
+    st.pyplot(fig)
+
+with tab5:
+    st.header("📊 Model Comparison (with Combined/Voting Models)")
+
+    # Load and clean dataset
+    df_cmp = (pd.read_csv(uploaded_file) if uploaded_file else pd.read_csv("heart.csv")).drop_duplicates().dropna()
+
+    # Remove outliers (except 'chol' like your original comment)
+    cont_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
+    mask = np.zeros(len(df_cmp), dtype=bool)
+    for c in cont_cols:
+        mask |= iqr_mask(df_cmp[c].values)
+    df_cmp = df_cmp.loc[~mask].copy()
+
+    # Split
+    X = df_cmp.drop("target", axis=1).values.astype(float)
+    y = df_cmp["target"].values.astype(int)
+    mean_c, std_c = standardize_fit(X)
+    X_scaled = standardize_transform(X, mean_c, std_c)
+    X_train, X_test, y_train, y_test = stratified_train_test_split(
+        X_scaled, y, test_size=0.2, random_state=42
+    )
+
+    # SMOTE
+    X_train_smote, y_train_smote = simple_smote(X_train, y_train, k=5, random_state=42)
+
+    # === Base models ===
+    knn13 = KNNClassifier(n_neighbors=13)
+    logreg = LogisticRegressionScratch(lr=0.1, epochs=2000, l2=0.001, random_state=42)
+    svm_lin = LinearSVMScratch(C=1.0, epochs=20, random_state=42)
+
+    # === Combined models ===
+    voting_hard = VotingClassifierScratch(
+        estimators=[("knn", knn13), ("lr", logreg), ("svm", svm_lin)],
+        voting="hard"
+    )
+    voting_soft = VotingClassifierScratch(
+        estimators=[("knn", knn13), ("lr", logreg), ("svm", svm_lin)],
+        voting="soft"
+    )
 
     models = {
-        "KNN (k=5)": knn,
+        "KNN (k=13)": knn13,
         "Logistic Regression": logreg,
-        "SVM (Linear)": svm
+        "SVM (Linear)": svm_lin,
+        "Combined (Hard Vote)": voting_hard,
+        "Combined (Soft Vote)": voting_soft
     }
 
-    results=[]
-    for name, m in models.items():
-        yp = m.predict(X_test)
-        acc,prec,rec,f1,(tn,fp,fn,tp) = precision_recall_f1(y_test, yp)
-        results.append({"Model":name, "Accuracy":acc, "Precision":prec, "Recall":rec, "F1 Score":f1, "CM":(tn,fp,fn,tp)})
+    # Train & evaluate
+    results = []
+    trained = {}
+    for name, model in models.items():
+        model.fit(X_train_smote, y_train_smote)
+        trained[name] = model
+        y_pred = model.predict(X_test)
+        results.append({
+            "Model": name,
+            "Accuracy": accuracy_score_np(y_test, y_pred),
+            "Precision": precision_score_np(y_test, y_pred),
+            "Recall": recall_score_np(y_test, y_pred),
+            "F1 Score": f1_score_np(y_test, y_pred)
+        })
 
-    # Voting (hard + soft using available proba/score)
-    # Hard vote
-    yp_hard=[]
-    for i in range(len(X_test)):
-        votes = [models["KNN (k=5)"].predict([X_test[i]])[0],
-                 models["Logistic Regression"].predict([X_test[i]])[0],
-                 models["SVM (Linear)"].predict([X_test[i]])[0]]
-        yp_hard.append(1 if sum(votes)>=2 else 0)
-    acc,prec,rec,f1,(tn,fp,fn,tp) = precision_recall_f1(y_test, yp_hard)
-    results.append({"Model":"Combined (Hard Vote)","Accuracy":acc,"Precision":prec,"Recall":rec,"F1 Score":f1,"CM":(tn,fp,fn,tp)})
+    df_results = pd.DataFrame(results)
 
-    # Soft vote: average of probabilities (SVM uses logistic of score)
-    yp_soft_probs=[]
-    for i in range(len(X_test)):
-        ps = []
-        for name in models:
-            p1 = models[name].predict_proba([X_test[i]])[0][1]
-            ps.append(p1)
-        p = sum(ps)/len(ps)
-        yp_soft_probs.append(p)
-    yp_soft = [1 if p>=0.5 else 0 for p in yp_soft_probs]
-    acc,prec,rec,f1,(tn,fp,fn,tp) = precision_recall_f1(y_test, yp_soft)
-    results.append({"Model":"Combined (Soft Vote)","Accuracy":acc,"Precision":prec,"Recall":rec,"F1 Score":f1,"CM":(tn,fp,fn,tp)})
+    # Display table
+    st.dataframe(df_results.style.format({
+        "Accuracy": "{:.3f}",
+        "Precision": "{:.3f}",
+        "Recall": "{:.3f}",
+        "F1 Score": "{:.3f}"
+    }))
 
-    # Show table
-    show_simple = [{"Model":r["Model"],
-                    "Accuracy":f'{r["Accuracy"]:.3f}',
-                    "Precision":f'{r["Precision"]:.3f}',
-                    "Recall":f'{r["Recall"]:.3f}',
-                    "F1 Score":f'{r["F1 Score"]:.3f}'} for r in results]
-    st.table(show_simple)
+    # Plot metrics (bar)
+    st.subheader("🔍 Metric Comparison")
+    df_melted = df_results.melt(id_vars="Model", var_name="Metric", value_name="Score")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.barplot(data=df_melted, x="Model", y="Score", hue="Metric")
+    plt.title("Model Performance Comparison")
+    plt.ylim(0.75, 1.0)
+    plt.xticks(rotation=15)
+    plt.tight_layout()
+    st.pyplot(fig)
 
-    # Bar of metrics (F1 only for compactness)
-    st.subheader("🔍 Metric Comparison (F1 Score)")
-    st.markdown(svg_bar_chart([(r["Model"], r["F1 Score"]) for r in results],
-                              title="F1 Score by Model"), unsafe_allow_html=True)
-
-    # ROC curves (where we have a score/prob)
+    # ROC curves (compute scores)
     st.subheader("📈 ROC Curves")
-    roc_svgs=[]
-    for name, m in models.items():
-        if hasattr(m, "predict_proba"):
-            scores = [m.predict_proba([x])[0][1] for x in X_test]
-        elif hasattr(m, "decision_function"):
-            scores = m.decision_function(X_test)
+    plt.figure(figsize=(8, 6))
+    for name, model in trained.items():
+        # score: probability if available, else decision function, else predicted label
+        if hasattr(model, "predict_proba"):
+            y_score = model.predict_proba(X_test)[:, 1]
+        elif hasattr(model, "decision_function"):
+            y_score = model.decision_function(X_test)
         else:
-            continue
-        fprs, tprs, _ = roc_curve_points(y_test, scores)
-        aucv = auc_trapezoid(sorted(fprs), [y for _,y in sorted(zip(fprs,tprs))])
-        roc_svgs.append((name, svg_roc(fprs,tprs,aucv, title=f"ROC - {name}")))
-    for name, svg in roc_svgs:
-        st.markdown(svg, unsafe_allow_html=True)
+            y_score = model.predict(X_test).astype(float)
+        fpr, tpr = roc_curve_np(y_test, y_score)
+        roc_auc = auc_np(fpr, tpr)
+        plt.plot(fpr, tpr, label=f"{name} (AUC = {roc_auc:.2f})")
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve Comparison")
+    plt.legend(loc="lower right")
+    plt.grid(True)
+    st.pyplot(plt)
 
     # Confusion Matrices
     st.subheader("🧮 Confusion Matrices")
-    for r in results:
-        tn,fp,fn,tp = r["CM"]
-        st.markdown(svg_confusion_matrix(tn,fp,fn,tp, title=f"Confusion Matrix - {r['Model']}"),
-                    unsafe_allow_html=True)
+    n_models_for_cm = len(models)
+    cols = 3
+    rows = int(np.ceil(n_models_for_cm / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
+    axes = np.array(axes).reshape(rows, cols)
+
+    idx = 0
+    last_cm = None
+    for name, model in trained.items():
+        r, c = divmod(idx, cols)
+        ax = axes[r, c]
+        y_pred = model.predict(X_test)
+        cm = confusion_matrix_np(y_test, y_pred)
+        im = ax.imshow(cm, cmap="Blues")
+        ax.set_title(name)
+        ax.set_xticks([0,1]); ax.set_yticks([0,1])
+        ax.set_xticklabels(["No", "Yes"])
+        ax.set_yticklabels(["No", "Yes"])
+        for (i,j), v in np.ndenumerate(cm):
+            ax.text(j, i, str(v), ha='center', va='center', fontsize=10)
+        idx += 1
+
+    # Hide any empty subplots
+    while idx < rows * cols:
+        r, c = divmod(idx, cols)
+        axes[r, c].axis("off")
+        idx += 1
+
+    plt.tight_layout()
+    st.pyplot(fig)
+
+    # Show last CM cells if needed
+    last_name = list(trained.keys())[-1]
+    cm_last = confusion_matrix_np(y_test, trained[last_name].predict(X_test))
+    tn, fp, fn, tp = cm_last.ravel()
+    st.write(f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
 
     # Best model by F1
-    best = max(results, key=lambda r: r["F1 Score"])
     st.subheader("🥇 Best Performing Model")
-    st.success(f"**{best['Model']}** performed best with F1 Score: **{best['F1 Score']:.3f}**")
+    best_model_row = df_results.loc[df_results["F1 Score"].idxmax()]
+    st.success(f"**{best_model_row['Model']}** performed best with F1 Score: **{best_model_row['F1 Score']:.3f}**")
 
+    # "Model size" & inference time (pickle bytes)
+    model_sizes = {}
+    inference_times = {}
+    for name, model in trained.items():
+        blob = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
+        model_sizes[name] = len(blob) / 1024  # KB
+        start = time.time()
+        _ = model.predict(X_test)
+        inference_times[name] = (time.time() - start) * 1000  # ms
+
+    df_meta = pd.DataFrame({
+        "Model": list(trained.keys()),
+        "Model Size (KB)": [model_sizes[m] for m in trained.keys()],
+        "Inference Time (ms)": [inference_times[m] for m in trained.keys()]
+    })
+
+    st.subheader("⚙️ Model Efficiency")
+    st.dataframe(df_meta.style.format({
+        "Model Size (KB)": "{:.2f}",
+        "Inference Time (ms)": "{:.2f}"
+    }))
+
+    # Download
+    st.subheader("⬇️Download")
+    @st.cache_data
+    def convert_df(df):
+        return df.to_csv(index=False).encode('utf-8')
+    csv = convert_df(df_results)
+    st.download_button("📥 Download Model Metrics", data=csv, file_name='model_comparison.csv', mime='text/csv')
