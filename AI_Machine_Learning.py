@@ -7,6 +7,8 @@ import io
 import time
 import joblib
 import os
+from sklearn.ensemble import VotingClassifier
+
 
 from sklearn.model_selection import cross_val_score
 from sklearn.metrics import roc_curve, auc
@@ -429,7 +431,7 @@ with tab4:
 
 with tab5:
 
-    st.header("📊 Model Comparison")
+    st.header("📊 Model Comparison (with Combined/Voting Models)")
 
     # Load and clean dataset
     df = pd.read_csv("heart.csv")
@@ -462,16 +464,37 @@ with tab5:
     smote = SMOTE(random_state=42)
     X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
 
-    # Models
+    # === Base models ===
+    knn13 = KNeighborsClassifier(n_neighbors=13)
+    logreg = LogisticRegression(max_iter=1000, random_state=42)
+    # IMPORTANT: probability=True so we can do soft voting + ROC
+    svm_rbf = SVC(kernel='rbf', C=0.1, probability=True, random_state=42)
+
+    # === Combined models ===
+    voting_hard = VotingClassifier(
+        estimators=[("knn", knn13), ("lr", logreg), ("svm", svm_rbf)],
+        voting="hard"
+    )
+    voting_soft = VotingClassifier(
+        estimators=[("knn", knn13), ("lr", logreg), ("svm", svm_rbf)],
+        voting="soft"  # averages predicted probabilities
+        # Optionally: weights=[1,1,1]  # or tune weights
+    )
+
     models = {
-        "KNN (k=13)": KNeighborsClassifier(n_neighbors=13),
-        "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
-        "SVM (C=0.1)": SVC(kernel='rbf', C=0.1, random_state=42)
+        "KNN (k=13)": knn13,
+        "Logistic Regression": logreg,
+        "SVM (C=0.1)": svm_rbf,
+        "Combined (Hard Vote)": voting_hard,
+        "Combined (Soft Vote)": voting_soft
     }
 
+    # Train & evaluate
     results = []
+    trained = {}
     for name, model in models.items():
         model.fit(X_train_smote, y_train_smote)
+        trained[name] = model
         y_pred = model.predict(X_test)
         results.append({
             "Model": name,
@@ -491,7 +514,7 @@ with tab5:
         "F1 Score": "{:.3f}"
     }))
 
-    # Plot
+    # Plot metrics (bar)
     st.subheader("🔍 Metric Comparison")
     df_melted = df_results.melt(id_vars="Model", var_name="Metric", value_name="Score")
 
@@ -503,11 +526,17 @@ with tab5:
     plt.tight_layout()
     st.pyplot(fig)
 
-    # Plot ROC curves
+    # ROC curves (works for all with predict_proba; for hard vote we skip)
     st.subheader("📈 ROC Curves")
     plt.figure(figsize=(8, 6))
-    for name, model in models.items():
-        y_score = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else model.decision_function(X_test)
+    for name, model in trained.items():
+        if hasattr(model, "predict_proba"):
+            y_score = model.predict_proba(X_test)[:, 1]
+        elif hasattr(model, "decision_function"):
+            y_score = model.decision_function(X_test)
+        else:
+            # Hard Vote has no score/proba -> skip from ROC
+            continue
         fpr, tpr, _ = roc_curve(y_test, y_score)
         roc_auc = auc(fpr, tpr)
         plt.plot(fpr, tpr, label=f"{name} (AUC = {roc_auc:.2f})")
@@ -519,45 +548,60 @@ with tab5:
     plt.legend(loc="lower right")
     plt.grid(True)
     st.pyplot(plt)
-    
-    
+
+    # Confusion Matrices
     st.subheader("🧮 Confusion Matrices")
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    for ax, (name, model) in zip(axes, models.items()):
+    n_models_for_cm = len(models)
+    cols = 3
+    rows = int(np.ceil(n_models_for_cm / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
+    axes = np.array(axes).reshape(rows, cols)
+
+    idx = 0
+    last_cm = None
+    for name, model in trained.items():
+        r, c = divmod(idx, cols)
+        ax = axes[r, c]
         y_pred = model.predict(X_test)
+        last_cm = confusion_matrix(y_test, y_pred)
         ConfusionMatrixDisplay.from_predictions(y_test, y_pred, ax=ax, cmap="Blues", colorbar=False)
         ax.set_title(name)
+        idx += 1
+
+    # Hide any empty subplots
+    while idx < rows * cols:
+        r, c = divmod(idx, cols)
+        axes[r, c].axis("off")
+        idx += 1
 
     plt.tight_layout()
     st.pyplot(fig)
 
-    cm = confusion_matrix(y_test, y_pred)
-    tn, fp, fn, tp = cm.ravel()
-    st.write(f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
+    if last_cm is not None:
+        tn, fp, fn, tp = last_cm.ravel()
+        st.write(f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
 
-
+    # Best model by F1
     st.subheader("🥇 Best Performing Model")
     best_model = df_results.loc[df_results["F1 Score"].idxmax()]
     st.success(f"**{best_model['Model']}** performed best with F1 Score: **{best_model['F1 Score']:.3f}**")
 
-    
-
+    # Save sizes + inference times
     model_sizes = {}
     inference_times = {}
-
-    for name, model in models.items():
-        filename = f"{name.replace(' ', '_')}.joblib"
+    for name, model in trained.items():
+        filename = f"{name.replace(' ', '_').replace('(', '').replace(')', '')}.joblib"
         joblib.dump(model, filename)
-        model_sizes[name] = os.path.getsize(filename) / 1024  # in KB
+        model_sizes[name] = os.path.getsize(filename) / 1024  # KB
 
         start = time.time()
         model.predict(X_test)
-        inference_times[name] = (time.time() - start) * 1000  # in ms
+        inference_times[name] = (time.time() - start) * 1000  # ms
 
     df_meta = pd.DataFrame({
-        "Model": list(models.keys()),
-        "Model Size (KB)": [model_sizes[m] for m in models.keys()],
-        "Inference Time (ms)": [inference_times[m] for m in models.keys()]
+        "Model": list(trained.keys()),
+        "Model Size (KB)": [model_sizes[m] for m in trained.keys()],
+        "Inference Time (ms)": [inference_times[m] for m in trained.keys()]
     })
 
     st.subheader("⚙️ Model Efficiency")
@@ -567,38 +611,36 @@ with tab5:
     }))
 
     st.subheader("📌 Feature Importance (Logistic Regression)")
-
-    log_model = models["Logistic Regression"]
-    importance = pd.Series(log_model.coef_[0], index=X.columns).sort_values()
-
+    importance = pd.Series(trained["Logistic Regression"].coef_[0], index=X.columns).sort_values()
     fig, ax = plt.subplots(figsize=(8, 6))
     importance.plot(kind="barh", ax=ax)
     plt.title("Feature Coefficients (Logistic Regression)")
     st.pyplot(fig)
 
-    
-    cv_scores = cross_val_score(model, X_scaled, y, cv=5)
-    st.write(f"Cross-Validation Accuracy: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+    # Cross-validation (use any model; showing soft vote here)
+    cv_scores = cross_val_score(trained["Combined (Soft Vote)"], X_scaled, y, cv=5)
+    st.write(f"Cross-Validation Accuracy (Combined Soft Vote): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
 
+    # Prediction distributions
     st.subheader("🔍 Prediction Distribution by Model")
-    for name, model in models.items():
+    for name, model in trained.items():
         y_pred = model.predict(X_test)
         fig, ax = plt.subplots()
         sns.countplot(x=y_pred, palette='pastel', ax=ax)
         ax.set_title(f"Predictions - {name}")
         st.pyplot(fig)
 
+    # Radar chart
     import plotly.express as px
-
     st.subheader("🧭 Radar Chart (Model Metrics Overview)")
     df_melted = df_results.melt(id_vars="Model", var_name="Metric", value_name="Score")
     fig_radar = px.line_polar(df_melted, r='Score', theta='Metric', color='Model', line_close=True,
-                          template='plotly_dark', height=500)
+                              template='plotly_dark', height=500)
     fig_radar.update_traces(fill='toself')
     st.plotly_chart(fig_radar)
 
+    # Download
     st.subheader("⬇️Download")
-
     @st.cache_data
     def convert_df(df):
         return df.to_csv(index=False).encode('utf-8')
