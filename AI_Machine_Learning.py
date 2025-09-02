@@ -610,35 +610,6 @@ with tab5:
         "Inference Time (ms)": "{:.2f}"
     }))
 
-    st.subheader("📌 Feature Importance (Logistic Regression)")
-    importance = pd.Series(trained["Logistic Regression"].coef_[0], index=X.columns).sort_values()
-    fig, ax = plt.subplots(figsize=(8, 6))
-    importance.plot(kind="barh", ax=ax)
-    plt.title("Feature Coefficients (Logistic Regression)")
-    st.pyplot(fig)
-
-    # Cross-validation (use any model; showing soft vote here)
-    cv_scores = cross_val_score(trained["Combined (Soft Vote)"], X_scaled, y, cv=5)
-    st.write(f"Cross-Validation Accuracy (Combined Soft Vote): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
-
-    # Prediction distributions
-    st.subheader("🔍 Prediction Distribution by Model")
-    for name, model in trained.items():
-        y_pred = model.predict(X_test)
-        fig, ax = plt.subplots()
-        sns.countplot(x=y_pred, palette='pastel', ax=ax)
-        ax.set_title(f"Predictions - {name}")
-        st.pyplot(fig)
-
-    # Radar chart
-    import plotly.express as px
-    st.subheader("🧭 Radar Chart (Model Metrics Overview)")
-    df_melted = df_results.melt(id_vars="Model", var_name="Metric", value_name="Score")
-    fig_radar = px.line_polar(df_melted, r='Score', theta='Metric', color='Model', line_close=True,
-                              template='plotly_dark', height=500)
-    fig_radar.update_traces(fill='toself')
-    st.plotly_chart(fig_radar)
-
     # Download
     st.subheader("⬇️Download")
     @st.cache_data
@@ -647,3 +618,4 @@ with tab5:
 
     csv = convert_df(df_results)
     st.download_button("📥 Download Model Metrics", data=csv, file_name='model_comparison.csv', mime='text/csv')
+
