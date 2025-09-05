@@ -18,13 +18,12 @@ from imblearn.over_sampling import SMOTE
 from sklearn.neighbors import KNeighborsClassifier
 
 # =========================
-# Manual metric/stat helpers
+# Metric/stat helpers
 # =========================
 
 def cm2x2(y_true, y_pred):
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred).astype(int)
-    # Classes: 0 (No Disease), 1 (Disease)
     tp = int(np.sum((y_true == 1) & (y_pred == 1)))
     tn = int(np.sum((y_true == 0) & (y_pred == 0)))
     fp = int(np.sum((y_true == 0) & (y_pred == 1)))
@@ -33,9 +32,7 @@ def cm2x2(y_true, y_pred):
                      [fn, tp]]), (tn, fp, fn, tp)
 
 def acc(y_true, y_pred):
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
-    return float((y_true == y_pred).mean())
+    return float((np.asarray(y_true) == np.asarray(y_pred)).mean())
 
 def prec(y_true, y_pred, positive=1):
     y_true = np.asarray(y_true)
@@ -57,7 +54,6 @@ def f1(y_true, y_pred, positive=1):
     return float(2 * p * r / (p + r)) if (p + r) > 0 else 0.0
 
 def classification_report_text(y_true, y_pred):
-    # Two classes: 0 and 1
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred).astype(int)
     lines = []
@@ -72,58 +68,7 @@ def classification_report_text(y_true, y_pred):
     overall_acc = acc(y_true, y_pred)
     lines.append("")
     lines.append(f"accuracy{overall_acc:>24.2f} {len(y_true):10d}")
-    # Macro avg
-    pm = 0.5 * (prec(y_true, y_pred, 0) + prec(y_true, y_pred, 1))
-    rm = 0.5 * (rec(y_true, y_pred, 0) + rec(y_true, y_pred, 1))
-    fm = 0.5 * (f1(y_true, y_pred, 0) + f1(y_true, y_pred, 1))
-    sup = len(y_true)
-    lines.append(f"{'macro avg':>14} {pm:10.2f} {rm:8.2f} {fm:9.2f} {sup:10d}")
-    # Weighted avg
-    w0 = np.sum(y_true == 0) / sup if sup else 0
-    w1 = np.sum(y_true == 1) / sup if sup else 0
-    pw = w0 * prec(y_true, y_pred, 0) + w1 * prec(y_true, y_pred, 1)
-    rw = w0 * rec(y_true, y_pred, 0) + w1 * rec(y_true, y_pred, 1)
-    fw = w0 * f1(y_true, y_pred, 0) + w1 * f1(y_true, y_pred, 1)
-    lines.append(f"{'weighted avg':>14} {pw:10.2f} {rw:8.2f} {fw:9.2f} {sup:10d}")
     return "\n".join(lines)
-
-def roc_curve_manual(y_true, y_score):
-    # y_true in {0,1}; y_score = probability or decision score for class 1
-    y_true = np.asarray(y_true).astype(int)
-    y_score = np.asarray(y_score).astype(float)
-
-    # Sort by descending score
-    order = np.argsort(-y_score)
-    y_true_sorted = y_true[order]
-    y_score_sorted = y_score[order]
-
-    # Unique thresholds include +/- inf endpoints to match sklearn behavior
-    thresholds = np.r_[np.inf, np.unique(y_score_sorted)[::-1], -np.inf]
-
-    P = np.sum(y_true_sorted == 1)
-    N = np.sum(y_true_sorted == 0)
-    tpr_list = []
-    fpr_list = []
-
-    # Vectorized cum-sums
-    tp_cum = np.cumsum(y_true_sorted == 1)
-    fp_cum = np.cumsum(y_true_sorted == 0)
-
-    # For each threshold, find index where score < threshold
-    for thr in thresholds:
-        idx = np.searchsorted(-y_score_sorted, -thr, side='right')
-        tp = tp_cum[idx - 1] if idx > 0 else 0
-        fp = fp_cum[idx - 1] if idx > 0 else 0
-        tpr_list.append(tp / P if P > 0 else 0.0)
-        fpr_list.append(fp / N if N > 0 else 0.0)
-
-    return np.array(fpr_list), np.array(tpr_list), thresholds
-
-def auc_trapz(x, y):
-    # Standard trapezoidal rule, identical to numpy.trapz
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    return float(np.trapz(y, x))
 
 def plot_confusion_matrix(ax, cm, title):
     im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
@@ -133,30 +78,20 @@ def plot_confusion_matrix(ax, cm, title):
     ax.set_yticks(tick_marks)
     ax.set_xticklabels(["No Disease", "Disease"])
     ax.set_yticklabels(["No Disease", "Disease"])
-    ax.set_ylabel('True label')
-    ax.set_xlabel('Predicted label')
-    # Write counts
-    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
     for i in range(2):
         for j in range(2):
             ax.text(j, i, format(cm[i, j], 'd'),
-                    ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black")
+                    ha="center", va="center", color="white" if cm[i, j] > cm.max()/2 else "black")
 
 def vif_manual(X_scaled, feature_names):
-    """
-    Compute VIF for each column using OLS via numpy lstsq.
-    VIF_i = 1 / (1 - R^2_i) where R^2_i is from regressing Xi on X_-i.
-    """
     Xs = np.asarray(X_scaled, dtype=float)
     n, p = Xs.shape
     out_rows = []
     for i in range(p):
         y = Xs[:, i]
         X_others = np.delete(Xs, i, axis=1)
-        # Add bias
         X_design = np.c_[np.ones((n, 1)), X_others]
-        beta, residuals, rank, s = np.linalg.lstsq(X_design, y, rcond=None)
+        beta, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
         y_pred = X_design @ beta
         ss_res = float(np.sum((y - y_pred) ** 2))
         ss_tot = float(np.sum((y - y.mean()) ** 2))
@@ -165,9 +100,8 @@ def vif_manual(X_scaled, feature_names):
         out_rows.append((feature_names[i], vif))
     return pd.DataFrame(out_rows, columns=["feature", "VIF"])
 
-
 # =========================
-# Data prep helper (original)
+# Data prep helper
 # =========================
 @st.cache_data
 def get_clean_scaled_data():
@@ -179,8 +113,7 @@ def get_clean_scaled_data():
         IQR = Q3 - Q1
         return (series < Q1 - 1.5 * IQR) | (series > Q3 + 1.5 * IQR)
 
-    continuous_cols = ['age', 'trestbps', 'thalach', 'oldpeak']
-    for col in continuous_cols:
+    for col in ['age', 'trestbps', 'thalach', 'oldpeak']:
         df = df[~is_outlier_iqr(df[col])]
 
     X = df.drop("target", axis=1)
@@ -198,22 +131,35 @@ def get_clean_scaled_data():
 
     return X_train_smote, X_test, y_train_smote, y_test, X.columns
 
-
+# =========================
+# Streamlit app
+# =========================
 st.set_page_config(page_title="Heart Disease Predictor", layout="wide")
 
-# ========== Sidebar ==========
 st.sidebar.title("🫀 Heart Disease Comparison")
 st.sidebar.markdown("Upload your dataset and explore model performance.📊")
 
+# Reference dataset for structure validation
+reference_df = pd.read_csv("heart.csv")
+reference_columns = list(reference_df.columns)
+reference_dtypes = reference_df.dtypes
+
 uploaded_file = st.sidebar.file_uploader("Upload CSV file", type=["csv"])
 if uploaded_file:
-    df = pd.read_csv(uploaded_file)
+    df_temp = pd.read_csv(uploaded_file)
+
+    # Check structure (columns + dtypes)
+    if list(df_temp.columns) != reference_columns or not all(df_temp.dtypes == reference_dtypes):
+        st.sidebar.error("❌ Invalid dataset structure! Please upload a dataset with the same structure as 'heart.csv'.")
+        df = reference_df.copy()
+    else:
+        df = df_temp.copy()
 else:
-    df = pd.read_csv("heart.csv")
+    df = reference_df.copy()
 
 st.sidebar.write(f"Dataset shape: {df.shape}")
 
-# ========== Page Tabs ==========
+# ========== Tabs ==========
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🔍 Preprocessing",
     "🪭 KNN", 
@@ -221,6 +167,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "👟 SVM", 
     "📊 Model Comparison"
 ])
+
 
 with tab1:
     st.header("🔍 Preprocessing: Missing Values, Outlier, Overfitting")
@@ -695,4 +642,5 @@ with tab5:
         return df.to_csv(index=False).encode('utf-8')
     csv = convert_df(df_results)
     st.download_button("📥 Download Model Metrics", data=csv, file_name='model_comparison.csv', mime='text/csv')
+
 
