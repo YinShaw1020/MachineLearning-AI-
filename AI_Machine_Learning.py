@@ -205,11 +205,29 @@ st.set_page_config(page_title="Heart Disease Predictor", layout="wide")
 st.sidebar.title("🫀 Heart Disease Comparison")
 st.sidebar.markdown("Upload your dataset and explore model performance.📊")
 
+# Load reference dataset structure
+reference_df = pd.read_csv("heart.csv")
+expected_columns = list(reference_df.columns)
+
 uploaded_file = st.sidebar.file_uploader("Upload CSV file", type=["csv"])
+
 if uploaded_file:
-    df = pd.read_csv(uploaded_file)
+    try:
+        df_test = pd.read_csv(uploaded_file)
+
+        # Check if columns match
+        if list(df_test.columns) != expected_columns:
+            st.sidebar.error("❌ Invalid dataset! Columns do not match the required heart.csv structure.")
+            df = reference_df.copy()  # fallback
+        else:
+            df = df_test.copy()
+
+    except Exception as e:
+        st.sidebar.error(f"⚠️ Error reading file: {e}")
+        df = reference_df.copy()
+
 else:
-    df = pd.read_csv("heart.csv")
+    df = reference_df.copy()
 
 st.sidebar.write(f"Dataset shape: {df.shape}")
 
@@ -695,3 +713,4 @@ with tab5:
         return df.to_csv(index=False).encode('utf-8')
     csv = convert_df(df_results)
     st.download_button("📥 Download Model Metrics", data=csv, file_name='model_comparison.csv', mime='text/csv')
+
